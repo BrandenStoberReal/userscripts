@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.0.3
+// @version      1.0.4
 // @description  When you open a Reddit post, automatically submit it to the Wayback Machine once every N hours.
 // @author       Branden Stober + GPT-o3
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -17,7 +17,7 @@
 // @grant        GM.registerMenuCommand
 // @grant        GM_addStyle
 // @connect      web.archive.org
-// @run-at       document-idle
+// @run-at       document-end
 // ==/UserScript==
 
 (() => {
