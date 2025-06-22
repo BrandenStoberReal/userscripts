@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.0.2
+// @version      1.0.3
 // @description  When you open a Reddit post, automatically submit it to the Wayback Machine once every N hours.
 // @author       Branden Stober + GPT-o3
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -104,10 +104,13 @@
 
         if (now() - lastSave < COOLDOWN_HOURS * 60 * 60 * 1000) return;
 
-        const ok = await submitToWayback(postUrl);
+        const { ok, status, headers } = await submitToWayback(postUrl);
         if (ok) {
             await store.set(postKey, Date.now());
-            showToast('Wayback snapshot queued ✓');
+            const msg = (status === 200 || status === 302)
+                ? 'Wayback snapshot stored ✓'
+                : 'Wayback snapshot queued (will appear soon) ⏳';
+            showToast(msg);
         } else {
             showToast('Wayback snapshot failed ✗', 4500);
         }
@@ -135,17 +138,14 @@
     function submitToWayback(pageUrl) {
       return new Promise(res => {
         GM.xmlHttpRequest({
-          method: 'GET',
-          url   : 'https://web.archive.org/save/' + encodeURIComponent(pageUrl),
-          headers: { 'User-Agent': navigator.userAgent },   // not strictly required but helps
+          method : 'GET',
+          url    : 'https://web.archive.org/save/' + encodeURIComponent(pageUrl),
           onload : r => {
-            console.info('[Wayback] response', r.status, r.finalUrl);
-            // Accept 200-399 (includes 202, 301, 302) as “queued”
-            res(r.status >= 200 && r.status < 400);
+            const queued = r.status >= 200 && r.status < 400;   // success family
+            res({ ok: queued, status: r.status, headers: r.responseHeaders });
           },
-          onerror: e => { console.warn('[Wayback] XHR error', e); res(false); }
+          onerror: _ => res({ ok: false, status: 0 })
         });
       });
     }
-
 })();
