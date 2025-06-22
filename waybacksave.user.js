@@ -3,7 +3,7 @@
 // @namespace    https://github.com/YourName/wayback-quick-save
 // @version      1.0.0
 // @description  Adds a small button to every page that sends the current URL to the Wayback Machine “Save Page Now” API.
-// @author       Your Name
+// @author       Branden Stober + GPT-o3
 // @match        *://*/*
 // @exclude      *://web.archive.org/*              // don’t show inside the archive itself
 // @grant        GM.xmlHttpRequest                  // cross-origin POST without CORS pre-flight
