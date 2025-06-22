@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wayback Quick-Save Button (draggable)
 // @namespace    https://github.com/YourName/wayback-quick-save
-// @version      1.1.0
+// @version      1.1.1
 // @description  Adds a small button to every page that you can drag anywhere; clicking submits the page to the Wayback Machine.
 // @author       Branden Stober + GPT-o3
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/refs/heads/main/waybacksave.user.js
@@ -36,15 +36,13 @@
             padding: 5px 9px;
             font: 12px/15px sans-serif;
             color: #fff;
-            background: rgba(0,0,0,.70);
+            background: #000;
             border: none;
             border-radius: 3px;
             cursor: pointer;             /* normal cursor */
-            opacity: .6;
-            transition: opacity .2s ease-in-out;
             user-select: none;           /* prevent accidental text highlights */
         }
-        #wbQuickSaveBtn:hover { opacity: 1; }
+        #wbQuickSaveBtn:hover { filter: brightness(1.15); }
         #wbQuickSaveBtn.wb--dragging { cursor: grabbing; }   /* during drag */
     `);
 
