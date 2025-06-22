@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.0.4
+// @version      1.0.5
 // @description  When you open a Reddit post, automatically submit it to the Wayback Machine once every N hours.
 // @author       Branden Stober + GPT-o3
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -56,15 +56,20 @@
         toast.className = 'wb-toast';
         toast.textContent = msg;
         document.body.appendChild(toast);
-
-        // trigger CSS transition
-        requestAnimationFrame(() => toast.classList.add('show'));
-
-        // remove after N ms
-        setTimeout(() => {
-            toast.classList.remove('show');
-            toast.addEventListener('transitionend', () => toast.remove(), { once: true });
-        }, ms);
+        const ready = () => {
+            const toast = document.createElement('div');
+            toast.className = 'wb-toast';
+            toast.textContent = msg;
+            document.body.appendChild(toast);
+    
+            requestAnimationFrame(() => toast.classList.add('show'));
+            setTimeout(() => {
+                toast.classList.remove('show');
+                toast.addEventListener('transitionend', () => toast.remove(), { once: true });
+            }, ms);
+        };
+        if (document.body) ready();
+        else document.addEventListener('DOMContentLoaded', ready, { once: true });
     }
     
     /* -------  state helpers  ------- */
