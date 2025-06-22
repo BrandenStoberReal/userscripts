@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.0.1
+// @version      1.0.2
 // @description  When you open a Reddit post, automatically submit it to the Wayback Machine once every N hours.
 // @author       Branden Stober + GPT-o3
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -133,13 +133,19 @@
     }
 
     function submitToWayback(pageUrl) {
-        return new Promise(res => {
-            GM.xmlHttpRequest({
-                method: 'GET',
-                url: 'https://web.archive.org/save/' + encodeURIComponent(pageUrl),
-                onload  : r => res(r.status === 200 || r.status === 302),
-                onerror : _ => res(false),
-            });
+      return new Promise(res => {
+        GM.xmlHttpRequest({
+          method: 'GET',
+          url   : 'https://web.archive.org/save/' + encodeURIComponent(pageUrl),
+          headers: { 'User-Agent': navigator.userAgent },   // not strictly required but helps
+          onload : r => {
+            console.info('[Wayback] response', r.status, r.finalUrl);
+            // Accept 200-399 (includes 202, 301, 302) as “queued”
+            res(r.status >= 200 && r.status < 400);
+          },
+          onerror: e => { console.warn('[Wayback] XHR error', e); res(false); }
         });
+      });
     }
+
 })();
