@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.0.0
+// @version      1.0.1
 // @description  When you open a Reddit post, automatically submit it to the Wayback Machine once every N hours.
 // @author       Branden Stober + GPT-o3
-// @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/refs/heads/main/autoarchivereddit.user.js
+// @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
+// @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @match        https://www.reddit.com/r/*/comments/*
 // @match        https://old.reddit.com/r/*/comments/*
 // @match        https://np.reddit.com/r/*/comments/*
@@ -14,6 +15,8 @@
 // @grant        GM.setValue
 // @grant        GM.xmlHttpRequest
 // @grant        GM.registerMenuCommand
+// @grant        GM_addStyle
+// @connect      web.archive.org
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -23,6 +26,47 @@
     const ENABLED_DEFAULT = true;      // Set to false if you want it shipped disabled
     /* ================================== */
 
+    /* -------  STYLE / TOAST  ------- */
+    GM_addStyle(`
+      .wb-toast {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        max-width: 260px;
+        padding: 8px 12px;
+        font: 13px/17px system-ui, sans-serif;
+        color: #fff;
+        background: #323232e6;     /* translucent dark */
+        border-radius: 4px;
+        box-shadow: 0 2px 4px rgba(0,0,0,.35);
+        opacity: 0;
+        transform: translateY(10px);
+        transition: opacity .25s ease-out, transform .25s ease-out;
+        z-index: 2147483647;
+        pointer-events: none;      /* don’t block clicks */
+      }
+      .wb-toast.show {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    `);
+
+    function showToast(msg, ms = 3500) {
+        const toast = document.createElement('div');
+        toast.className = 'wb-toast';
+        toast.textContent = msg;
+        document.body.appendChild(toast);
+
+        // trigger CSS transition
+        requestAnimationFrame(() => toast.classList.add('show'));
+
+        // remove after N ms
+        setTimeout(() => {
+            toast.classList.remove('show');
+            toast.addEventListener('transitionend', () => toast.remove(), { once: true });
+        }, ms);
+    }
+    
     /* -------  state helpers  ------- */
     const KEY_ENABLED = '_enabled';                // global on/off switch
     const now = () => Date.now();
@@ -53,19 +97,20 @@
         if (!await isEnabled()) return;
 
         const postUrl = getCanonicalPostUrl();
-        if (!postUrl) return;   // not a recognised post permalink (shouldn’t happen because of @match)
+        if (!postUrl) return;
 
-        const postKey = 'ts_' + postUrl;                     // storage key for this post
-        const lastSaved = await store.get(postKey, 0);
+        const postKey  = 'ts_' + postUrl;
+        const lastSave = await store.get(postKey, 0);
 
-        if (now() - lastSaved < COOLDOWN_HOURS * hours) {
-            console.info('[Wayback auto-archiver] Cooldown active for', postUrl);
-            return;
+        if (now() - lastSave < COOLDOWN_HOURS * 60 * 60 * 1000) return;
+
+        const ok = await submitToWayback(postUrl);
+        if (ok) {
+            await store.set(postKey, Date.now());
+            showToast('Wayback snapshot queued ✓');
+        } else {
+            showToast('Wayback snapshot failed ✗', 4500);
         }
-
-        submitToWayback(postUrl).then(ok => {
-            if (ok) store.set(postKey, now());
-        });
     })();
 
     /* -------  helpers  ------- */
@@ -88,22 +133,12 @@
     }
 
     function submitToWayback(pageUrl) {
-        const archiveApi = 'https://web.archive.org/save/' + encodeURIComponent(pageUrl);
-        console.info('[Wayback auto-archiver] submitting', pageUrl);
-
-        return new Promise(resolve => {
+        return new Promise(res => {
             GM.xmlHttpRequest({
                 method: 'GET',
-                url: archiveApi,
-                headers: { 'User-Agent': navigator.userAgent },
-                onload: resp => {
-                    console.info('[Wayback auto-archiver] Wayback response', resp.status);
-                    resolve(resp.status === 200 || resp.status === 302);
-                },
-                onerror: err => {
-                    console.warn('[Wayback auto-archiver] archive request failed', err);
-                    resolve(false);
-                },
+                url: 'https://web.archive.org/save/' + encodeURIComponent(pageUrl),
+                onload  : r => res(r.status === 200 || r.status === 302),
+                onerror : _ => res(false),
             });
         });
     }
