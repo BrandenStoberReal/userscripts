@@ -4,6 +4,7 @@
 // @version      1.0.0
 // @description  When you open a Reddit post, automatically submit it to the Wayback Machine once every N hours.
 // @author       Branden Stober + GPT-o3
+// @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/refs/heads/main/autoarchivereddit.user.js
 // @match        https://www.reddit.com/r/*/comments/*
 // @match        https://old.reddit.com/r/*/comments/*
 // @match        https://np.reddit.com/r/*/comments/*
