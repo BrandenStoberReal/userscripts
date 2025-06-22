@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.0.5
+// @version      1.0.6
 // @description  When you open a Reddit post, automatically submit it to the Wayback Machine once every N hours.
 // @author       Branden Stober + GPT-o3
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -109,6 +109,7 @@
 
         if (now() - lastSave < COOLDOWN_HOURS * 60 * 60 * 1000) return;
 
+        showToast("Submitting to wayback machine... ⏳");
         const { ok, status, headers } = await submitToWayback(postUrl);
         if (ok) {
             await store.set(postKey, Date.now());
