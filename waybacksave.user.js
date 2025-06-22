@@ -4,6 +4,7 @@
 // @version      1.1.0
 // @description  Adds a small button to every page that you can drag anywhere; clicking submits the page to the Wayback Machine.
 // @author       Branden Stober + GPT-o3
+// @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/refs/heads/main/waybacksave.user.js
 // @match        *://*/*
 // @exclude      *://web.archive.org/*
 // @grant        GM.xmlHttpRequest
