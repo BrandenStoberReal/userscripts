@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.2.1
+// @version      1.2.2
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -10,6 +10,12 @@
 // @match        https://old.reddit.com/r/*/comments/*
 // @match        https://np.reddit.com/r/*/comments/*
 // @match        https://redd.it/*
+// @match        https://www.reddit.com/
+// @match        https://www.reddit.com/r/*
+// @match        https://old.reddit.com/
+// @match        https://old.reddit.com/r/*
+// @match        https://np.reddit.com/
+// @match        https://np.reddit.com/r/*
 // @icon         https://www.redditstatic.com/desktop2x/img/favicon/apple-icon-57x57.png
 // @grant        GM.getValue
 // @grant        GM.setValue
@@ -19,6 +25,7 @@
 // @connect      web.archive.org
 // @run-at       document-start
 // ==/UserScript==
+
 
 (() => {
   /* ========== USER SETTINGS ========== */
