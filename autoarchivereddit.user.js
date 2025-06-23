@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.2.0
+// @version      1.2.1
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -29,7 +29,8 @@
   /* ---------- tiny helpers ---------- */
   const HOUR       = 36e5;
   const KEY_GLOBAL = '_enabled';
-  const KEY_QUEUE = '_archive_queue';  // New key for the archive queue
+  const KEY_QUEUE = '_archive_queue';
+  const KEY_LAST_URL = '_last_url';  // Track the last URL even between page loads
   const store = {
     get: (k, d) => GM.getValue(k, d),
     set: (k, v) => GM.setValue(k, v)
@@ -84,7 +85,6 @@
   });
 
   /* ---------- Archive Queue System ---------- */
-  // New queue system to handle persistence across page loads
   async function addToArchiveQueue(url) {
     const queue = await store.get(KEY_QUEUE, []);
     
@@ -136,7 +136,6 @@
     }
     
     // Remove this item from the queue regardless of success
-    // (if it failed, we'll encounter it again on future page visits)
     await removeFromArchiveQueue(item.url);
     
     // Process the next item after a short delay
@@ -146,7 +145,6 @@
   }
 
   /* ---------- main work ---------- */
-  let lastCanonical = null;
   let processingPage = false; // Prevent multiple simultaneous runs
 
   async function handlePage() {
@@ -165,11 +163,18 @@
         return;               // not a post
       }
       
+      // Check against last URL from storage instead of in-memory variable
+      const lastCanonical = await store.get(KEY_LAST_URL, null);
+      
       if (canon === lastCanonical) {
+        log('Same post as last time, skipping:', canon);
         processingPage = false;
         return;
       }
-      lastCanonical = canon;
+      
+      // Update the last URL in storage
+      await store.set(KEY_LAST_URL, canon);
+      log('New post detected:', canon);
 
       const key = 'ts_' + canon;
       const last = await store.get(key, 0);
@@ -251,6 +256,9 @@
 
   /* ---------- SPA navigation hook ---------- */
   function setupNavHooks() {
+    // Force check the page immediately on startup
+    setTimeout(handlePage, 100);
+    
     // 1. Intercept push/replaceState
     const push = history.pushState, repl = history.replaceState;
     history.pushState = function() { 
@@ -272,7 +280,7 @@
         lastUrl = location.href;
         handlePage();
       }
-    }, 1000);
+    }, 500); // Check more frequently (reduced from 1000ms)
     
     // 4. Run once on initial load
     if (document.readyState === 'loading') {
@@ -283,6 +291,50 @@
     
     // 5. Set up periodic queue processing even if no navigation occurs
     setInterval(processArchiveQueue, 60000);
+    
+    // 6. Additional hook for Reddit's infinite scroll behavior
+    // This detects content changes that might not trigger URL changes
+    const observeDOM = (function(){
+      const MutationObserver = window.MutationObserver || window.WebKitMutationObserver;
+      
+      return function(obj, callback){
+        if (!obj || obj.nodeType !== 1) return;
+        
+        if (MutationObserver) {
+          const mutationObserver = new MutationObserver(callback);
+          mutationObserver.observe(obj, { childList: true, subtree: true });
+          return mutationObserver;
+        } else if (window.addEventListener) {
+          obj.addEventListener('DOMNodeInserted', callback, false);
+          obj.addEventListener('DOMNodeRemoved', callback, false);
+          return {
+            disconnect: function(){
+              obj.removeEventListener('DOMNodeInserted', callback);
+              obj.removeEventListener('DOMNodeRemoved', callback);
+            }
+          };
+        }
+      };
+    })();
+    
+    // Start observing once the DOM is ready
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        observeDOM(document.body, function(mutations) {
+          // Only trigger on significant DOM changes
+          if (mutations.some(m => m.addedNodes.length > 3)) {
+            setTimeout(handlePage, 200);
+          }
+        });
+      });
+    } else {
+      observeDOM(document.body, function(mutations) {
+        // Only trigger on significant DOM changes
+        if (mutations.some(m => m.addedNodes.length > 3)) {
+          setTimeout(handlePage, 200);
+        }
+      });
+    }
   }
   
   // Set up all navigation hooks
