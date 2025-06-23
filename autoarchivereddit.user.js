@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.1.0
+// @version      1.2.0
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -29,6 +29,7 @@
   /* ---------- tiny helpers ---------- */
   const HOUR       = 36e5;
   const KEY_GLOBAL = '_enabled';
+  const KEY_QUEUE = '_archive_queue';  // New key for the archive queue
   const store = {
     get: (k, d) => GM.getValue(k, d),
     set: (k, v) => GM.setValue(k, v)
@@ -71,6 +72,9 @@
   // Initialize enabled state as soon as possible
   store.get(KEY_GLOBAL, ENABLED_DEFAULT).then(val => {
     isEnabled = !!val;
+    
+    // Process any queued items from previous sessions
+    processArchiveQueue();
   });
 
   GM.registerMenuCommand('Toggle auto-archiving', async () => {
@@ -78,6 +82,68 @@
     await store.set(KEY_GLOBAL, isEnabled);
     alert(`Reddit → Wayback auto-archiver is now ${isEnabled ? 'ENABLED' : 'DISABLED'}.`);
   });
+
+  /* ---------- Archive Queue System ---------- */
+  // New queue system to handle persistence across page loads
+  async function addToArchiveQueue(url) {
+    const queue = await store.get(KEY_QUEUE, []);
+    
+    // Only add if not already in queue
+    if (!queue.some(item => item.url === url)) {
+      queue.push({
+        url: url,
+        addedAt: Date.now()
+      });
+      await store.set(KEY_QUEUE, queue);
+      log('Added to archive queue:', url);
+    }
+  }
+
+  async function removeFromArchiveQueue(url) {
+    const queue = await store.get(KEY_QUEUE, []);
+    const newQueue = queue.filter(item => item.url !== url);
+    
+    if (queue.length !== newQueue.length) {
+      await store.set(KEY_QUEUE, newQueue);
+      log('Removed from archive queue:', url);
+    }
+  }
+
+  async function processArchiveQueue() {
+    if (!isEnabled) return;
+    
+    const queue = await store.get(KEY_QUEUE, []);
+    if (queue.length === 0) return;
+    
+    log(`Processing archive queue (${queue.length} items)...`);
+    
+    // Process one item at a time to avoid overwhelming the Wayback Machine
+    const item = queue[0];
+    
+    try {
+      const success = await submitToWayback(item.url);
+      
+      if (success) {
+        // Set cooldown timestamp
+        const key = 'ts_' + item.url;
+        await store.set(key, Date.now());
+        log('Successfully archived and set cooldown for:', item.url);
+      } else {
+        log('Failed to archive, will retry later:', item.url);
+      }
+    } catch (err) {
+      console.error('[Wayback-archiver] Error processing queue item:', err);
+    }
+    
+    // Remove this item from the queue regardless of success
+    // (if it failed, we'll encounter it again on future page visits)
+    await removeFromArchiveQueue(item.url);
+    
+    // Process the next item after a short delay
+    if (queue.length > 1) {
+      setTimeout(processArchiveQueue, 5000);
+    }
+  }
 
   /* ---------- main work ---------- */
   let lastCanonical = null;
@@ -116,13 +182,11 @@
       // Show submission notification immediately
       showToast('Submitting to Wayback Machine...');
       
-      // Submit to Wayback
-      const success = await submitToWayback(canon);
+      // Add to persistent queue instead of trying to archive immediately
+      await addToArchiveQueue(canon);
       
-      // Only set cooldown if request was successful
-      if (success) {
-        await store.set(key, Date.now());
-      }
+      // Start processing the queue
+      processArchiveQueue();
     } catch (err) {
       console.error('[Wayback-archiver] Error:', err);
     } finally {
@@ -142,14 +206,23 @@
         onload : r => {
           const success = r.status >= 200 && r.status < 400;
           log('Wayback response', r.status, url);
+          
+          if (success) {
+            showToast('Successfully archived to Wayback Machine!');
+          } else {
+            showToast('Failed to archive to Wayback Machine. Will retry later.');
+          }
+          
           res(success);
         },
         onerror: e => {
           console.error('Wayback XHR error', e);
+          showToast('Error connecting to Wayback Machine. Will retry later.');
           res(false);
         },
         ontimeout: () => {
           console.error('Wayback XHR timeout');
+          showToast('Wayback Machine request timed out. Will retry later.');
           res(false);
         }
       });
@@ -207,6 +280,9 @@
     } else {
       handlePage();
     }
+    
+    // 5. Set up periodic queue processing even if no navigation occurs
+    setInterval(processArchiveQueue, 60000);
   }
   
   // Set up all navigation hooks
