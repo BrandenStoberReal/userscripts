@@ -1,21 +1,15 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.2.2
+// @version      1.3.0
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
-// @match        https://www.reddit.com/r/*/comments/*
-// @match        https://old.reddit.com/r/*/comments/*
-// @match        https://np.reddit.com/r/*/comments/*
+// @match        https://www.reddit.com/*
+// @match        https://old.reddit.com/*
+// @match        https://np.reddit.com/*
 // @match        https://redd.it/*
-// @match        https://www.reddit.com/
-// @match        https://www.reddit.com/r/*
-// @match        https://old.reddit.com/
-// @match        https://old.reddit.com/r/*
-// @match        https://np.reddit.com/
-// @match        https://np.reddit.com/r/*
 // @icon         https://www.redditstatic.com/desktop2x/img/favicon/apple-icon-57x57.png
 // @grant        GM.getValue
 // @grant        GM.setValue
@@ -25,7 +19,6 @@
 // @connect      web.archive.org
 // @run-at       document-start
 // ==/UserScript==
-
 
 (() => {
   /* ========== USER SETTINGS ========== */
@@ -164,11 +157,17 @@
         return;
       }
 
+      // Here's the key change: We check if the current URL is a post
+      // If not, we log it but don't try to archive it
       const canon = getCanonicalPostUrl(location.href);
+      
       if (!canon) {
+        log('Not a post page, skipping:', location.href);
         processingPage = false;
-        return;               // not a post
+        return;
       }
+      
+      log('Detected post page:', canon);
       
       // Check against last URL from storage instead of in-memory variable
       const lastCanonical = await store.get(KEY_LAST_URL, null);
