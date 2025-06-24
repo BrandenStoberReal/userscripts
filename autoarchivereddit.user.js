@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.7.2
-// @description  A robust script to auto-submit Reddit posts to the Wayback Machine. Reverted queue rotation.
+// @version      1.7.3
+// @description  A robust script to auto-submit Reddit posts to the Wayback Machine. Final, safe queue logic.
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -75,52 +75,61 @@
   }
 
   // =================================================================
-  // ========== SIMPLIFIED BATCH QUEUE PROCESSING LOGIC ==============
+  // ========== FINAL, ATOMIC BATCH QUEUE PROCESSING LOGIC ===========
   // =================================================================
   async function processArchiveQueue() {
     if (isQueueProcessing) { log('Queue is already being processed. Skipping.'); return; }
     if (!isEnabled) return;
     
+    // Step 1: Take a snapshot of the work to be done. DO NOT modify the queue yet.
     const tasksToProcess = await store.get(KEY_QUEUE, []);
     if (tasksToProcess.length === 0) return;
 
     isQueueProcessing = true;
     log(`Acquired lock. Processing a batch of ${tasksToProcess.length} items.`);
     
-    // Clear the stored queue immediately to prevent race conditions.
-    // New items added while this runs will be handled in the next batch.
-    await store.set(KEY_QUEUE, []);
-    
-    const failedTasks = [];
+    const succeededUrls = [];
 
     try {
       for (const item of tasksToProcess) {
-        // Self-healing validation
-        if (!item || typeof item.url !== 'string' || item.url.length === 0) {
-            console.error('[Wayback-archiver] CRITICAL: Found and discarded a corrupted item.', item);
-            continue; // Skip to the next item in the batch
+        if (!item || typeof item.url !== 'string') {
+            console.error('[Wayback-archiver] Found and will remove a corrupted item.', item);
+            succeededUrls.push(item); // Treat corrupted items as "successful" to remove them.
+            continue;
         }
 
         log('Attempting to archive:', item.url);
         const success = await submitToWayback(item.url);
-
         if (success) {
             log('Archive successful for:', item.url);
             await store.set('ts_' + item.url, Date.now());
+            succeededUrls.push(item.url);
         } else {
-            log('Archive failed, will re-queue:', item.url);
-            failedTasks.push(item);
+            log('Archive failed, item will remain in queue for next run.', item.url);
         }
       }
     } catch (err) {
         console.error('[Wayback-archiver] A critical error occurred during batch processing.', err);
     } finally {
-        if (failedTasks.length > 0) {
-            log(`Re-queuing ${failedTasks.length} failed tasks.`);
-            const currentQueue = await store.get(KEY_QUEUE, []); // Get any brand new items
-            // Add the failed tasks after any new items for the next run.
-            await store.set(KEY_QUEUE, [...currentQueue, ...failedTasks]);
-        }
+        // Step 2: Final Reconciliation.
+        log(`Reconciling queue. ${succeededUrls.length} items were successfully processed.`);
+        
+        // Get the absolute latest version of the queue, which may include new items
+        // added while the batch was running.
+        const latestQueue = await store.get(KEY_QUEUE, []);
+        
+        // Create the final queue by filtering out only the URLs that we know succeeded.
+        // This preserves both failed items and brand new items.
+        const finalQueue = latestQueue.filter(item => {
+            // Check if item is valid before accessing URL
+            if (!item || typeof item.url !== 'string') {
+                return false; // Remove corrupted items
+            }
+            return !succeededUrls.includes(item.url);
+        });
+        
+        await store.set(KEY_QUEUE, finalQueue);
+        
         isQueueProcessing = false;
         log('Released lock. Batch processing complete.');
     }
@@ -174,7 +183,7 @@
     try {
       const url = new URL(href);
       if (url.hostname === 'redd.it') { const p = url.pathname.replace(/^\/|\/$/g, ''); return p ? `https://old.reddit.com/comments/${p}` : null; }
-      const m = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
+      const m = url.pathname.match(/\/(?:comments|gallery)\/([a-z0--9]+)/i);
       return (m && m[1]) ? `https://old.reddit.com/comments/${m[1]}` : null;
     } catch (e) { return null; }
   }
@@ -186,7 +195,7 @@
     const s = document.createElement('script'); s.id = id;
     s.textContent = `(()=>{const d=()=>window.dispatchEvent(new CustomEvent('${ev}')),h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
     (document.head || document.documentElement).appendChild(s);
-    s.remove();
+s.remove();
   }
 
   function setupNavHooks() {
