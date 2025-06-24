@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.4.0
+// @version      1.4.1
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -114,9 +114,7 @@
     }
     await removeFromArchiveQueue(item.url);
     if (queue.length > 1) {
-      // *** CHANGE: Increased delay from 5000ms to 20000ms (20 seconds) ***
-      // This is much safer and less likely to trigger rate limits.
-      setTimeout(processArchiveQueue, 20000);
+      setTimeout(processArchiveQueue, 20000); // 20 second delay between requests
     }
   }
 
@@ -130,14 +128,18 @@
       if (!isEnabled) return;
       const canon = getCanonicalPostUrl(location.href);
       if (!canon) {
+        log('Not a post page, skipping:', location.href);
         processingPage = false;
         return;
       }
+      
       const lastCanonical = await store.get(KEY_LAST_URL, null);
       if (canon === lastCanonical) {
+        log('Same post as last time, skipping:', canon);
         processingPage = false;
         return;
       }
+      
       await store.set(KEY_LAST_URL, canon);
       log('New post detected:', canon);
 
@@ -165,15 +167,12 @@
       GM.xmlHttpRequest({
         method : 'GET',
         url    : saveUrl,
-        // *** CHANGE: Removed the explicit User-Agent header. ***
-        // This is the main cause of 520 errors. The browser will add it correctly.
-        timeout: 60000, // Increased timeout to 60s as archiving can be slow
+        timeout: 60000,
         onload : r => {
-          // A 520 error from Cloudflare will be caught here.
           if (r.status === 520) {
             console.error('Wayback response 520: Server error. Likely rate-limited.', url);
             showToast('Wayback Machine is busy. Will retry later.');
-            res(false); // Treat as failure
+            res(false);
             return;
           }
           const success = r.status >= 200 && r.status < 400;
@@ -219,33 +218,25 @@
 
   /* ---------- SPA navigation hook ---------- */
   function setupNavHooks() {
-    // *** CHANGE: Simplified the navigation hooks significantly. ***
-    // We only need to observe history changes and have a single periodic check.
-    // This prevents multiple triggers for the same navigation event.
-    let lastUrl = location.href;
-
+    // *** CHANGE: Corrected the navigation hook logic. ***
+    // This debouncer now correctly calls handlePage without performing its own
+    // faulty URL check. It simply prevents handlePage from firing too rapidly.
     const debouncedHandlePage = (() => {
         let timer;
         return () => {
             clearTimeout(timer);
-            timer = setTimeout(() => {
-                // We check the URL again inside the debounced function
-                // to ensure we're acting on the *latest* URL.
-                if (lastUrl !== location.href) {
-                    lastUrl = location.href;
-                    handlePage();
-                }
-            }, 150); // A small delay to bundle rapid-fire events
+            timer = setTimeout(handlePage, 250); // Use a 250ms debounce delay
         };
     })();
 
-    // 1. Intercept push/replaceState
+    // 1. Intercept push/replaceState for SPA navigation
     const origPushState = history.pushState;
-    const origReplaceState = history.replaceState;
     history.pushState = function(...args) {
         origPushState.apply(this, args);
         debouncedHandlePage();
     };
+    
+    const origReplaceState = history.replaceState;
     history.replaceState = function(...args) {
         origReplaceState.apply(this, args);
         debouncedHandlePage();
@@ -254,14 +245,14 @@
     // 2. Listen for popstate (browser back/forward buttons)
     window.addEventListener('popstate', debouncedHandlePage);
 
-    // 3. Run once on initial load
+    // 3. Run once on initial page load
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', handlePage);
     } else {
       handlePage();
     }
-
-    // 4. Set up periodic queue processing
+    
+    // 4. Periodically process the queue in case of missed events
     setInterval(processArchiveQueue, 60000);
   }
   
