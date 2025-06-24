@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.4.2
+// @version      1.5.0
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
-// @author       Branden Stober
+// @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @match        https://www.reddit.com/*
@@ -45,7 +45,7 @@
     transition:opacity .25s,transform .25s;z-index:2147483647;pointer-events:none}
    .wb-toast.show{opacity:1;transform:translateY(0)}
   `);
-  
+
   function showToast(msg, ms = 3500) {
     if (!document.body) {
       window.addEventListener('DOMContentLoaded', () => showToast(msg, ms));
@@ -132,14 +132,14 @@
         processingPage = false;
         return;
       }
-      
+
       const lastCanonical = await store.get(KEY_LAST_URL, null);
       if (canon === lastCanonical) {
         log('Same post as last time, skipping:', canon);
         processingPage = false;
         return;
       }
-      
+
       await store.set(KEY_LAST_URL, canon);
       log('New post detected:', canon);
 
@@ -198,19 +198,42 @@
     });
   }
 
-  /* ---------- canonicalisation ---------- */
+  // =================================================================
+  // ========== FIXED FUNCTION =======================================
+  // =================================================================
+  /**
+   * This function has been rewritten to be more robust.
+   * It now uses a simpler regex that can find the post ID from multiple
+   * different URL structures used by Reddit's modern interface.
+   */
   function getCanonicalPostUrl(href) {
     try {
-      let url = new URL(href);
+      const url = new URL(href);
+
+      // Handle redd.it shortlinks first, as they are unambiguous.
       if (url.hostname === 'redd.it') {
-        return `https://old.reddit.com/comments/${url.pathname.replace(/^\/|\/$/g, '')}`;
+        const postId = url.pathname.replace(/^\/|\/$/g, '');
+        if (postId) {
+          // old.reddit.com/comments/ID is a stable, canonical link that will redirect.
+          return `https://old.reddit.com/comments/${postId}`;
+        }
       }
-      const match = url.pathname.match(/^\/r\/([^/]+)\/comments\/([A-Za-z0-9]+)(\/|$)/);
-      if (match) {
-        const [, sub, postId] = match;
-        return `https://old.reddit.com/r/${sub}/comments/${postId}`;
+
+      // This robust regex finds the post ID from various path structures:
+      // - /r/subreddit/comments/post_id/post_title/
+      // - /comments/post_id/
+      // - /gallery/post_id
+      const match = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
+
+      if (match && match[1]) {
+        const postId = match[1];
+        // We create a canonical link that old.reddit.com understands.
+        // It will automatically redirect to the full, correct URL,
+        // so we don't need to parse the subreddit from the path.
+        return `https://old.reddit.com/comments/${postId}`;
       }
-    } catch {
+    } catch (e) {
+      console.error('[Wayback-archiver] Error parsing URL:', href, e);
       return null;
     }
     return null;
@@ -231,7 +254,7 @@
         origPushState.apply(this, args);
         debouncedHandlePage();
     };
-    
+
     const origReplaceState = history.replaceState;
     history.replaceState = function(...args) {
         origReplaceState.apply(this, args);
@@ -240,18 +263,14 @@
 
     window.addEventListener('popstate', debouncedHandlePage);
 
-    // *** CHANGE: Initial page load now uses the debouncer. ***
-    // This prevents the race condition where handlePage runs twice,
-    // once immediately and once from a history event, causing it to
-    // incorrectly flag the page as a duplicate of itself.
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', debouncedHandlePage);
     } else {
       debouncedHandlePage();
     }
-    
+
     setInterval(processArchiveQueue, 60000);
   }
-  
+
   setupNavHooks();
 })();
