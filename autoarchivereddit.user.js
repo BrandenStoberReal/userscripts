@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.6.4
+// @version      1.6.5
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -75,47 +75,55 @@
   }
 
   // =================================================================
-  // ========== REWRITTEN & ROBUST QUEUE PROCESSING LOGIC ============
+  // ========== FINAL, ROBUST QUEUE PROCESSING LOGIC =================
   // =================================================================
   async function processArchiveQueue() {
     if (isQueueProcessing) { log('Queue is already being processed. Skipping.'); return; }
     if (!isEnabled) return;
 
-    let queue = await store.get(KEY_QUEUE, []);
-    if (queue.length === 0) return;
+    // Get the item to process WITHOUT modifying the queue yet
+    const initialQueue = await store.get(KEY_QUEUE, []);
+    if (initialQueue.length === 0) return;
+    const itemToProcess = initialQueue[0];
 
     isQueueProcessing = true;
-    log('Acquired queue processing lock.');
+    log('Acquired queue processing lock for item:', itemToProcess.url);
 
-    // **KEY CHANGE**: Immediately remove the item from the front of the queue.
-    const item = queue.shift();
-    
     try {
-        log(`Dequeued item for processing:`, item.url);
-        const success = await submitToWayback(item.url);
+      const success = await submitToWayback(itemToProcess.url);
 
-        if (success) {
-            log('Archive successful, item permanently removed.', item.url);
-            await store.set('ts_' + item.url, Date.now());
-            // On success, we do nothing to the queue; the item is already gone.
-        } else {
-            log('Archive failed, adding item to back of queue.', item.url);
-            // **KEY CHANGE**: On failure, add the exact same item back to the end.
-            queue.push(item);
-        }
+      // **CRITICAL FIX**: After the long task is done, get a FRESH copy of the queue.
+      // This ensures we don't overwrite changes made by addToArchiveQueue while we were waiting.
+      const currentQueue = await store.get(KEY_QUEUE, []);
+      let finalQueue;
+
+      if (success) {
+        log('Archive successful. Removing item from queue.', itemToProcess.url);
+        // Create the new queue by filtering out the successfully processed item.
+        finalQueue = currentQueue.filter(item => item.url !== itemToProcess.url);
+        await store.set('ts_' + itemToProcess.url, Date.now());
+      } else {
+        log('Archive failed. Rotating item to back of queue.', itemToProcess.url);
+        // Create the new queue by filtering the item and re-adding it at the end.
+        finalQueue = currentQueue.filter(item => item.url !== itemToProcess.url);
+        finalQueue.push(itemToProcess);
+      }
+      
+      // Now, save the correctly modified queue.
+      await store.set(KEY_QUEUE, finalQueue);
+
     } catch (err) {
-        console.error('[Wayback-archiver] Error processing item. It will be re-added to the queue.', err);
-        // Also add it back on a critical error to avoid losing it.
-        queue.push(item);
+      console.error('[Wayback-archiver] Critical error during processing. Item will be rotated.', err);
+      // Even on a critical error, we still rotate to prevent getting stuck.
+      const currentQueue = await store.get(KEY_QUEUE, []);
+      const finalQueue = currentQueue.filter(item => item.url !== itemToProcess.url);
+      finalQueue.push(itemToProcess);
+      await store.set(KEY_QUEUE, finalQueue);
     } finally {
-        // **KEY CHANGE**: Save the modified queue (either shorter or rotated) back to storage.
-        await store.set(KEY_QUEUE, queue);
-        
-        isQueueProcessing = false;
-        log('Released queue processing lock.');
+      isQueueProcessing = false;
+      log('Released queue processing lock.');
     }
   }
-
 
   /* ---------- main work ---------- */
   async function handlePage() {
