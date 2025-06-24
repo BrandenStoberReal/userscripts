@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.6.3
+// @version      1.6.4
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -71,73 +71,51 @@
       queue.push({ url: url, addedAt: Date.now() });
       await store.set(KEY_QUEUE, queue);
       log('Added to archive queue:', url);
-    } else {
-      log('URL is already in the queue, not adding again:', url);
-    }
-  }
-
-  async function removeFromArchiveQueue(url) {
-    const queue = await store.get(KEY_QUEUE, []);
-    const newQueue = queue.filter(item => item.url !== url);
-    if (queue.length !== newQueue.length) {
-      await store.set(KEY_QUEUE, newQueue);
-      log('Removed from archive queue:', url);
     }
   }
 
   // =================================================================
-  // ========== NEW HELPER FUNCTION TO FIX BLOCKING QUEUE ============
+  // ========== REWRITTEN & ROBUST QUEUE PROCESSING LOGIC ============
   // =================================================================
-  /**
-   * Moves the first item of the queue to the end. This is called on
-   * failure to prevent one bad item from blocking all subsequent items.
-   */
-  async function rotateQueue() {
-    const queue = await store.get(KEY_QUEUE, []);
-    if (queue.length > 1) {
-      const failedItem = queue.shift(); // Remove from front
-      queue.push(failedItem);           // Add to back
-      await store.set(KEY_QUEUE, queue);
-      log('Rotated queue, moved failing item to the end:', failedItem.url);
-    }
-  }
-
   async function processArchiveQueue() {
     if (isQueueProcessing) { log('Queue is already being processed. Skipping.'); return; }
     if (!isEnabled) return;
-    
-    // Check for items BEFORE acquiring lock
-    const initialQueue = await store.get(KEY_QUEUE, []);
-    if (initialQueue.length === 0) return;
+
+    let queue = await store.get(KEY_QUEUE, []);
+    if (queue.length === 0) return;
 
     isQueueProcessing = true;
     log('Acquired queue processing lock.');
 
+    // **KEY CHANGE**: Immediately remove the item from the front of the queue.
+    const item = queue.shift();
+    
     try {
-      // Get a fresh copy of the queue inside the lock
-      const queue = await store.get(KEY_QUEUE, []);
-      if (queue.length === 0) return; // Check again in case it changed
+        log(`Dequeued item for processing:`, item.url);
+        const success = await submitToWayback(item.url);
 
-      log(`Processing archive queue (${queue.length} items)...`);
-      const item = queue[0];
-      const success = await submitToWayback(item.url);
-
-      if (success) {
-        log('Archive successful for:', item.url);
-        await store.set('ts_' + item.url, Date.now());
-        await removeFromArchiveQueue(item.url); // This is now safe
-      } else {
-        log('Archive failed, moving to back of queue to retry later.', item.url);
-        await rotateQueue();
-      }
+        if (success) {
+            log('Archive successful, item permanently removed.', item.url);
+            await store.set('ts_' + item.url, Date.now());
+            // On success, we do nothing to the queue; the item is already gone.
+        } else {
+            log('Archive failed, adding item to back of queue.', item.url);
+            // **KEY CHANGE**: On failure, add the exact same item back to the end.
+            queue.push(item);
+        }
     } catch (err) {
-      console.error('[Wayback-archiver] Error processing queue. Moving item to back.', err);
-      await rotateQueue();
+        console.error('[Wayback-archiver] Error processing item. It will be re-added to the queue.', err);
+        // Also add it back on a critical error to avoid losing it.
+        queue.push(item);
     } finally {
-      isQueueProcessing = false;
-      log('Released queue processing lock.');
+        // **KEY CHANGE**: Save the modified queue (either shorter or rotated) back to storage.
+        await store.set(KEY_QUEUE, queue);
+        
+        isQueueProcessing = false;
+        log('Released queue processing lock.');
     }
   }
+
 
   /* ---------- main work ---------- */
   async function handlePage() {
@@ -172,7 +150,7 @@
         method: 'GET', url: saveUrl, timeout: 60000,
         onload: r => {
           const success = r.status >= 200 && r.status < 400;
-          if (r.status === 520) console.error('Wayback 520: Server error.', url);
+          if (r.status >= 500) console.error(`Wayback server error (${r.status})`, url);
           log('Wayback response', r.status, url);
           showToast(success ? 'Successfully archived!' : 'Archive failed, will retry.');
           res(success);
