@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.7.1
-// @description  A robust script to auto-submit Reddit posts to the Wayback Machine, with a self-healing queue.
+// @version      1.7.2
+// @description  A robust script to auto-submit Reddit posts to the Wayback Machine. Reverted queue rotation.
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -75,48 +75,54 @@
   }
 
   // =================================================================
-  // ========== FINAL, BULLETPROOF QUEUE PROCESSING LOGIC ============
+  // ========== SIMPLIFIED BATCH QUEUE PROCESSING LOGIC ==============
   // =================================================================
   async function processArchiveQueue() {
     if (isQueueProcessing) { log('Queue is already being processed. Skipping.'); return; }
     if (!isEnabled) return;
     
-    let queue = await store.get(KEY_QUEUE, []);
-    if (queue.length === 0) return;
+    const tasksToProcess = await store.get(KEY_QUEUE, []);
+    if (tasksToProcess.length === 0) return;
 
     isQueueProcessing = true;
-    const item = queue.shift(); // Take item off the front immediately.
-
-    // Self-healing validation
-    if (!item || typeof item.url !== 'string' || item.url.length === 0) {
-        console.error('[Wayback-archiver] CRITICAL: Found corrupted item in queue. Discarding it.', item);
-        await store.set(KEY_QUEUE, queue); // Save the queue without the bad item.
-        isQueueProcessing = false;
-        if (queue.length > 0) setTimeout(processArchiveQueue, 10); 
-        return;
-    }
-
-    log('Acquired lock. Processing item:', item.url);
+    log(`Acquired lock. Processing a batch of ${tasksToProcess.length} items.`);
+    
+    // Clear the stored queue immediately to prevent race conditions.
+    // New items added while this runs will be handled in the next batch.
+    await store.set(KEY_QUEUE, []);
+    
+    const failedTasks = [];
 
     try {
+      for (const item of tasksToProcess) {
+        // Self-healing validation
+        if (!item || typeof item.url !== 'string' || item.url.length === 0) {
+            console.error('[Wayback-archiver] CRITICAL: Found and discarded a corrupted item.', item);
+            continue; // Skip to the next item in the batch
+        }
+
+        log('Attempting to archive:', item.url);
         const success = await submitToWayback(item.url);
+
         if (success) {
-            log('Archive successful, item permanently removed.', item.url);
+            log('Archive successful for:', item.url);
             await store.set('ts_' + item.url, Date.now());
         } else {
-            log('Archive failed, adding item to back of queue.', item.url);
-            // **THE DEFINITIVE FIX**: Create a BRAND NEW, clean object
-            // instead of re-using the old `item` reference.
-            queue.push({ url: item.url, addedAt: item.addedAt });
+            log('Archive failed, will re-queue:', item.url);
+            failedTasks.push(item);
         }
+      }
     } catch (err) {
-        console.error('[Wayback-archiver] Error processing item. It will be re-added to queue.', err);
-        // Also re-create a fresh object on critical error.
-        queue.push({ url: item.url, addedAt: item.addedAt });
+        console.error('[Wayback-archiver] A critical error occurred during batch processing.', err);
     } finally {
-        await store.set(KEY_QUEUE, queue);
+        if (failedTasks.length > 0) {
+            log(`Re-queuing ${failedTasks.length} failed tasks.`);
+            const currentQueue = await store.get(KEY_QUEUE, []); // Get any brand new items
+            // Add the failed tasks after any new items for the next run.
+            await store.set(KEY_QUEUE, [...currentQueue, ...failedTasks]);
+        }
         isQueueProcessing = false;
-        log('Released lock.');
+        log('Released lock. Batch processing complete.');
     }
   }
 
