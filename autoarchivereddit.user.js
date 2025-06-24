@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.7.3
-// @description  A robust script to auto-submit Reddit posts to the Wayback Machine. Final, safe queue logic.
+// @version      1.7.4
+// @description  A robust script to auto-submit Reddit posts to the Wayback Machine. Fixes critical syntax error.
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -74,14 +74,10 @@
     }
   }
 
-  // =================================================================
-  // ========== FINAL, ATOMIC BATCH QUEUE PROCESSING LOGIC ===========
-  // =================================================================
   async function processArchiveQueue() {
     if (isQueueProcessing) { log('Queue is already being processed. Skipping.'); return; }
     if (!isEnabled) return;
     
-    // Step 1: Take a snapshot of the work to be done. DO NOT modify the queue yet.
     const tasksToProcess = await store.get(KEY_QUEUE, []);
     if (tasksToProcess.length === 0) return;
 
@@ -94,7 +90,7 @@
       for (const item of tasksToProcess) {
         if (!item || typeof item.url !== 'string') {
             console.error('[Wayback-archiver] Found and will remove a corrupted item.', item);
-            succeededUrls.push(item); // Treat corrupted items as "successful" to remove them.
+            if (item && item.url) succeededUrls.push(item.url); // Use its own URL to remove if possible
             continue;
         }
 
@@ -111,25 +107,15 @@
     } catch (err) {
         console.error('[Wayback-archiver] A critical error occurred during batch processing.', err);
     } finally {
-        // Step 2: Final Reconciliation.
-        log(`Reconciling queue. ${succeededUrls.length} items were successfully processed.`);
-        
-        // Get the absolute latest version of the queue, which may include new items
-        // added while the batch was running.
-        const latestQueue = await store.get(KEY_QUEUE, []);
-        
-        // Create the final queue by filtering out only the URLs that we know succeeded.
-        // This preserves both failed items and brand new items.
-        const finalQueue = latestQueue.filter(item => {
-            // Check if item is valid before accessing URL
-            if (!item || typeof item.url !== 'string') {
-                return false; // Remove corrupted items
-            }
-            return !succeededUrls.includes(item.url);
-        });
-        
-        await store.set(KEY_QUEUE, finalQueue);
-        
+        if (succeededUrls.length > 0) {
+            log(`Reconciling queue. ${succeededUrls.length} items to remove.`);
+            const latestQueue = await store.get(KEY_QUEUE, []);
+            const finalQueue = latestQueue.filter(item => {
+                if (!item || typeof item.url !== 'string') return false; // Remove corrupted
+                return !succeededUrls.includes(item.url);
+            });
+            await store.set(KEY_QUEUE, finalQueue);
+        }
         isQueueProcessing = false;
         log('Released lock. Batch processing complete.');
     }
@@ -178,12 +164,18 @@
     });
   }
 
-  /* ---------- canonicalisation ---------- */
+  // =================================================================
+  // ========== FIXED CANONICAL URL FUNCTION =========================
+  // =================================================================
   function getCanonicalPostUrl(href) {
     try {
       const url = new URL(href);
-      if (url.hostname === 'redd.it') { const p = url.pathname.replace(/^\/|\/$/g, ''); return p ? `https://old.reddit.com/comments/${p}` : null; }
-      const m = url.pathname.match(/\/(?:comments|gallery)\/([a-z0--9]+)/i);
+      if (url.hostname === 'redd.it') { 
+        const p = url.pathname.replace(/^\/|\/$/g, ''); 
+        return p ? `https://old.reddit.com/comments/${p}` : null;
+      }
+      // **THE CRITICAL FIX IS HERE**: [a-z0-9] is the correct syntax.
+      const m = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
       return (m && m[1]) ? `https://old.reddit.com/comments/${m[1]}` : null;
     } catch (e) { return null; }
   }
@@ -195,7 +187,8 @@
     const s = document.createElement('script'); s.id = id;
     s.textContent = `(()=>{const d=()=>window.dispatchEvent(new CustomEvent('${ev}')),h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
     (document.head || document.documentElement).appendChild(s);
-s.remove();
+    // **RELIABILITY FIX**: Do not remove the script tag immediately.
+    // Let it persist to guarantee it has time to execute.
   }
 
   function setupNavHooks() {
