@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.6.2
+// @version      1.6.3
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -48,37 +48,22 @@
   `);
 
   function showToast(msg, ms = 3500) {
-    if (!document.body) {
-      window.addEventListener('DOMContentLoaded', () => showToast(msg, ms));
-      return;
-    }
+    if (!document.body) { window.addEventListener('DOMContentLoaded', () => showToast(msg, ms)); return; }
     const el = document.createElement('div');
     el.className = 'wb-toast';
     el.textContent = msg;
     document.body.appendChild(el);
     setTimeout(() => el.classList.add('show'), 10);
-    setTimeout(() => {
-      el.classList.remove('show');
-      setTimeout(() => el.remove(), 300);
-    }, ms);
+    setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); }, ms);
   }
 
   /* ---------- enable / disable ---------- */
   let isEnabled = ENABLED_DEFAULT;
-  store.get(KEY_GLOBAL, ENABLED_DEFAULT).then(val => {
-    isEnabled = !!val;
-    log(`Script status loaded. Enabled: ${isEnabled}`);
-  });
-
-  GM.registerMenuCommand('Toggle auto-archiving', async () => {
-    isEnabled = !isEnabled;
-    await store.set(KEY_GLOBAL, isEnabled);
-    alert(`Reddit → Wayback auto-archiver is now ${isEnabled ? 'ENABLED' : 'DISABLED'}.`);
-  });
-
+  store.get(KEY_GLOBAL, ENABLED_DEFAULT).then(val => { isEnabled = !!val; log(`Script status loaded. Enabled: ${isEnabled}`); });
+  GM.registerMenuCommand('Toggle auto-archiving', async () => { isEnabled = !isEnabled; await store.set(KEY_GLOBAL, isEnabled); alert(`Reddit → Wayback auto-archiver is now ${isEnabled ? 'ENABLED' : 'DISABLED'}.`); });
 
   /* ---------- Archive Queue System ---------- */
-  let isQueueProcessing = false; // The new processing lock
+  let isQueueProcessing = false;
 
   async function addToArchiveQueue(url) {
     const queue = await store.get(KEY_QUEUE, []);
@@ -101,23 +86,38 @@
   }
 
   // =================================================================
-  // ========== FIXED FUNCTION WITH PROCESSING LOCK ==================
+  // ========== NEW HELPER FUNCTION TO FIX BLOCKING QUEUE ============
   // =================================================================
-  async function processArchiveQueue() {
-    // 1. Check if a process is already running. If so, exit.
-    if (isQueueProcessing) {
-      log('Queue is already being processed. Skipping this run.');
-      return;
-    }
-    if (!isEnabled) return;
+  /**
+   * Moves the first item of the queue to the end. This is called on
+   * failure to prevent one bad item from blocking all subsequent items.
+   */
+  async function rotateQueue() {
     const queue = await store.get(KEY_QUEUE, []);
-    if (queue.length === 0) return;
+    if (queue.length > 1) {
+      const failedItem = queue.shift(); // Remove from front
+      queue.push(failedItem);           // Add to back
+      await store.set(KEY_QUEUE, queue);
+      log('Rotated queue, moved failing item to the end:', failedItem.url);
+    }
+  }
 
-    // 2. Acquire the lock to prevent other calls from running.
+  async function processArchiveQueue() {
+    if (isQueueProcessing) { log('Queue is already being processed. Skipping.'); return; }
+    if (!isEnabled) return;
+    
+    // Check for items BEFORE acquiring lock
+    const initialQueue = await store.get(KEY_QUEUE, []);
+    if (initialQueue.length === 0) return;
+
     isQueueProcessing = true;
     log('Acquired queue processing lock.');
 
     try {
+      // Get a fresh copy of the queue inside the lock
+      const queue = await store.get(KEY_QUEUE, []);
+      if (queue.length === 0) return; // Check again in case it changed
+
       log(`Processing archive queue (${queue.length} items)...`);
       const item = queue[0];
       const success = await submitToWayback(item.url);
@@ -125,20 +125,19 @@
       if (success) {
         log('Archive successful for:', item.url);
         await store.set('ts_' + item.url, Date.now());
-        log('Set 24-hour cooldown for:', item.url);
-        await removeFromArchiveQueue(item.url);
+        await removeFromArchiveQueue(item.url); // This is now safe
       } else {
-        log('Archive failed, will retry later:', item.url);
+        log('Archive failed, moving to back of queue to retry later.', item.url);
+        await rotateQueue();
       }
     } catch (err) {
-      console.error('[Wayback-archiver] Error processing queue item:', err);
+      console.error('[Wayback-archiver] Error processing queue. Moving item to back.', err);
+      await rotateQueue();
     } finally {
-      // 3. ALWAYS release the lock, ensuring the function can run again later.
       isQueueProcessing = false;
       log('Released queue processing lock.');
     }
   }
-
 
   /* ---------- main work ---------- */
   async function handlePage() {
@@ -147,16 +146,9 @@
     log('handlePage triggered for URL:', currentUrl);
     try {
       const canon = getCanonicalPostUrl(currentUrl);
-      if (!canon) {
-        log('Not a post page, skipping:', currentUrl);
-        await store.set(KEY_LAST_URL, '');
-        return;
-      }
+      if (!canon) { log('Not a post page, skipping.', currentUrl); await store.set(KEY_LAST_URL, ''); return; }
       const lastCanonical = await store.get(KEY_LAST_URL, null);
-      if (canon === lastCanonical) {
-        log('Same post as last time, skipping:', canon);
-        return;
-      }
+      if (canon === lastCanonical) { log('Same post as last time, skipping.', canon); return; }
       const lastTimestamp = await store.get('ts_' + canon, 0);
       if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
         log('Cool-down active, already saved recently →', canon);
@@ -180,7 +172,7 @@
         method: 'GET', url: saveUrl, timeout: 60000,
         onload: r => {
           const success = r.status >= 200 && r.status < 400;
-          if (r.status === 520) console.error('Wayback response 520: Server error. Likely rate-limited.', url);
+          if (r.status === 520) console.error('Wayback 520: Server error.', url);
           log('Wayback response', r.status, url);
           showToast(success ? 'Successfully archived!' : 'Archive failed, will retry.');
           res(success);
@@ -195,37 +187,25 @@
   function getCanonicalPostUrl(href) {
     try {
       const url = new URL(href);
-      if (url.hostname === 'redd.it') {
-        const postId = url.pathname.replace(/^\/|\/$/g, '');
-        return postId ? `https://old.reddit.com/comments/${postId}` : null;
-      }
-      const match = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
-      return (match && match[1]) ? `https://old.reddit.com/comments/${match[1]}` : null;
+      if (url.hostname === 'redd.it') { const p = url.pathname.replace(/^\/|\/$/g, ''); return p ? `https://old.reddit.com/comments/${p}` : null; }
+      const m = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
+      return (m && m[1]) ? `https://old.reddit.com/comments/${m[1]}` : null;
     } catch (e) { return null; }
   }
 
   /* ---------- ROBUST NAVIGATION HOOK VIA SCRIPT INJECTION ---------- */
   function injectNavigationListener() {
-    const SCRIPT_ID = 'history-hook-script', EVENT_NAME = 'wayback_history_changed';
-    if (document.getElementById(SCRIPT_ID)) return;
-    const script = document.createElement('script'); script.id = SCRIPT_ID;
-    script.textContent = `(() => {
-        const d = () => window.dispatchEvent(new CustomEvent('${EVENT_NAME}'));
-        const h = history, p = h.pushState, r = h.replaceState;
-        h.pushState = function(...a) { p.apply(this, a); d(); };
-        h.replaceState = function(...a) { r.apply(this, a); d(); };
-        window.addEventListener('popstate', d);
-      })();`;
-    (document.head || document.documentElement).appendChild(script);
-    script.remove();
+    const id = 'history-hook-script', ev = 'wayback_history_changed';
+    if (document.getElementById(id)) return;
+    const s = document.createElement('script'); s.id = id;
+    s.textContent = `(()=>{const d=()=>window.dispatchEvent(new CustomEvent('${ev}')),h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
+    (document.head || document.documentElement).appendChild(s);
+    s.remove();
   }
 
   function setupNavHooks() {
     injectNavigationListener();
-    const debouncedHandlePage = (() => {
-        let timer;
-        return () => { clearTimeout(timer); timer = setTimeout(handlePage, 500); };
-    })();
+    const debouncedHandlePage = (() => { let t; return () => { clearTimeout(t); t = setTimeout(handlePage, 500); }; })();
     window.addEventListener('wayback_history_changed', debouncedHandlePage);
     debouncedHandlePage();
     setInterval(processArchiveQueue, 60000);
