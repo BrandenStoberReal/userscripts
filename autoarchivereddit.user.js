@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.6.0
+// @version      1.6.1
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -24,7 +24,7 @@
   /* ========== USER SETTINGS ========== */
   const COOLDOWN_HOURS  = 24;
   const ENABLED_DEFAULT = true;
-  const DEBUG_LOGGING   = true; // Set to false to hide verbose logs
+  const DEBUG_LOGGING   = true;
   /* =================================== */
 
   /* ---------- tiny helpers ---------- */
@@ -83,6 +83,8 @@
       queue.push({ url: url, addedAt: Date.now() });
       await store.set(KEY_QUEUE, queue);
       log('Added to archive queue:', url);
+    } else {
+      log('URL is already in the queue, not adding again:', url);
     }
   }
 
@@ -95,28 +97,45 @@
     }
   }
 
+  // =================================================================
+  // ========== FIXED FUNCTION =======================================
+  // =================================================================
+  /**
+   * This function has been rewritten to be more robust. It now only
+   * removes an item from the queue after a SUCCESSFUL archive.
+   * If an archive fails, the item remains in the queue to be retried later.
+   */
   async function processArchiveQueue() {
     if (!isEnabled) return;
     const queue = await store.get(KEY_QUEUE, []);
     if (queue.length === 0) return;
+
     log(`Processing archive queue (${queue.length} items)...`);
     const item = queue[0];
+
     try {
       const success = await submitToWayback(item.url);
+
       if (success) {
+        log('Archive successful for:', item.url);
+        // 1. Set the long-term cooldown timestamp. THIS IS THE KEY FIX.
         await store.set('ts_' + item.url, Date.now());
-        log('Successfully archived and set cooldown for:', item.url);
+        log('Set 24-hour cooldown for:', item.url);
+
+        // 2. Remove the item from the queue now that it's done.
+        await removeFromArchiveQueue(item.url);
+
       } else {
-        log('Failed to archive, will retry later:', item.url);
+        log('Archive failed, will retry later:', item.url);
+        // On failure, we DO NOT remove the item from the queue.
+        // It will be retried automatically by the setInterval.
       }
     } catch (err) {
       console.error('[Wayback-archiver] Error processing queue item:', err);
-    }
-    await removeFromArchiveQueue(item.url);
-    if (queue.length > 1) {
-      setTimeout(processArchiveQueue, 20000);
+      // Also do nothing, let it be retried.
     }
   }
+
 
   /* ---------- main work ---------- */
   async function handlePage() {
@@ -124,7 +143,7 @@
       log('Handler called, but script is disabled. Aborting.');
       return;
     }
-    
+
     const currentUrl = location.href;
     log('handlePage triggered for URL:', currentUrl);
 
@@ -142,18 +161,21 @@
         return;
       }
 
-      await store.set(KEY_LAST_URL, canon);
-      log('New post detected:', canon);
-
+      // Check for the 24-hour cooldown BEFORE adding to the queue.
       const lastTimestamp = await store.get('ts_' + canon, 0);
       if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
         log('Cool-down active, already saved recently →', canon);
+        // Also update KEY_LAST_URL here to prevent re-triggering on minor URL changes
+        await store.set(KEY_LAST_URL, canon);
         return;
       }
 
-      showToast('Submitting to Wayback Machine...');
+      await store.set(KEY_LAST_URL, canon);
+      log('New post detected:', canon);
+
       await addToArchiveQueue(canon);
-      processArchiveQueue();
+      processArchiveQueue(); // Start processing immediately
+
     } catch (err) {
       console.error('[Wayback-archiver] Error in handlePage:', err);
     }
@@ -203,65 +225,34 @@
     }
   }
 
-  // =================================================================
-  // ========== ROBUST NAVIGATION HOOK VIA SCRIPT INJECTION ==========
-  // =================================================================
-  /**
-   * Injects a script into the page's context to reliably listen for
-   * history changes, bypassing the userscript sandbox limitations.
-   * When a navigation occurs, it dispatches a custom event that our
-   * sandboxed script can listen for.
-   */
+  /* ---------- ROBUST NAVIGATION HOOK VIA SCRIPT INJECTION ---------- */
   function injectNavigationListener() {
     const SCRIPT_ID = 'history-hook-script';
     const EVENT_NAME = 'wayback_history_changed';
-    
     if (document.getElementById(SCRIPT_ID)) return;
-
     const script = document.createElement('script');
     script.id = SCRIPT_ID;
-    script.textContent = `
-      (() => {
-        const dispatchHistoryChangeEvent = () => {
-          window.dispatchEvent(new CustomEvent('${EVENT_NAME}'));
-        };
-        const originalPushState = history.pushState;
-        history.pushState = function(...args) {
-          originalPushState.apply(this, args);
-          dispatchHistoryChangeEvent();
-        };
-        const originalReplaceState = history.replaceState;
-        history.replaceState = function(...args) {
-          originalReplaceState.apply(this, args);
-          dispatchHistoryChangeEvent();
-        };
-        // Also listen for back/forward browser buttons
-        window.addEventListener('popstate', dispatchHistoryChangeEvent);
-      })();
-    `;
+    script.textContent = `(() => {
+        const dispatch = () => window.dispatchEvent(new CustomEvent('${EVENT_NAME}'));
+        const oPush = history.pushState, oRepl = history.replaceState;
+        history.pushState = function(...a) { oPush.apply(this, a); dispatch(); };
+        history.replaceState = function(...a) { oRepl.apply(this, a); dispatch(); };
+        window.addEventListener('popstate', dispatch);
+      })();`;
     (document.head || document.documentElement).appendChild(script);
-    script.remove(); // Clean up the script tag from the DOM after it has run
+    script.remove();
     log('Navigation listener injected into page context.');
   }
 
   function setupNavHooks() {
     injectNavigationListener();
-
     const debouncedHandlePage = (() => {
         let timer;
-        return () => {
-            clearTimeout(timer);
-            timer = setTimeout(handlePage, 500); // A generous delay
-        };
+        return () => { clearTimeout(timer); timer = setTimeout(handlePage, 500); };
     })();
-
-    // Listen for the custom event dispatched by our injected script
     window.addEventListener('wayback_history_changed', debouncedHandlePage);
-
-    // Run once on initial load
     debouncedHandlePage();
-    
-    setInterval(processArchiveQueue, 60000);
+    setInterval(processArchiveQueue, 60000); // Periodically retry failed items
   }
 
   log('Userscript injected.');
