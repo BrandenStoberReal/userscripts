@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.7.0
+// @version      1.7.1
 // @description  A robust script to auto-submit Reddit posts to the Wayback Machine, with a self-healing queue.
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -87,13 +87,11 @@
     isQueueProcessing = true;
     const item = queue.shift(); // Take item off the front immediately.
 
-    // **CRITICAL FIX: VALIDATE THE QUEUE ITEM**
-    // This detects corruption and prevents the 'undefined' error.
+    // Self-healing validation
     if (!item || typeof item.url !== 'string' || item.url.length === 0) {
         console.error('[Wayback-archiver] CRITICAL: Found corrupted item in queue. Discarding it.', item);
         await store.set(KEY_QUEUE, queue); // Save the queue without the bad item.
-        isQueueProcessing = false; // Release the lock.
-        // Immediately try to process the next item if there is one.
+        isQueueProcessing = false;
         if (queue.length > 0) setTimeout(processArchiveQueue, 10); 
         return;
     }
@@ -107,13 +105,15 @@
             await store.set('ts_' + item.url, Date.now());
         } else {
             log('Archive failed, adding item to back of queue.', item.url);
-            queue.push(item); // Add the validated item back to the end.
+            // **THE DEFINITIVE FIX**: Create a BRAND NEW, clean object
+            // instead of re-using the old `item` reference.
+            queue.push({ url: item.url, addedAt: item.addedAt });
         }
     } catch (err) {
         console.error('[Wayback-archiver] Error processing item. It will be re-added to queue.', err);
-        queue.push(item); // Also re-add on critical error.
+        // Also re-create a fresh object on critical error.
+        queue.push({ url: item.url, addedAt: item.addedAt });
     } finally {
-        // Always save the modified queue (either shorter or rotated).
         await store.set(KEY_QUEUE, queue);
         isQueueProcessing = false;
         log('Released lock.');
