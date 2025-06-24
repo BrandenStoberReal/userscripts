@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.5.0
+// @version      1.5.1
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -24,6 +24,7 @@
   /* ========== USER SETTINGS ========== */
   const COOLDOWN_HOURS  = 24;
   const ENABLED_DEFAULT = true;
+  const DEBUG_LOGGING   = true; // Set to false to hide verbose logs
   /* =================================== */
 
   /* ---------- tiny helpers ---------- */
@@ -35,7 +36,7 @@
     get: (k, d) => GM.getValue(k, d),
     set: (k, v) => GM.setValue(k, v)
   };
-  const log = (...a) => console.log('[Wayback-archiver]', ...a);
+  const log = (...a) => DEBUG_LOGGING && console.log('[Wayback-archiver]', ...a);
 
   /* ---------- little toast ---------- */
   GM.addStyle(`
@@ -66,6 +67,7 @@
   let isEnabled = ENABLED_DEFAULT;
   store.get(KEY_GLOBAL, ENABLED_DEFAULT).then(val => {
     isEnabled = !!val;
+    log(`Script status loaded. Enabled: ${isEnabled}`);
     processArchiveQueue();
   });
 
@@ -122,21 +124,27 @@
   let processingPage = false;
 
   async function handlePage() {
-    if (processingPage) return;
+    if (!isEnabled) {
+      log('Handler called, but script is disabled. Aborting.');
+      return;
+    }
+    if (processingPage) {
+      log('Handler called, but a page is already being processed. Aborting.');
+      return;
+    }
     processingPage = true;
+    log('handlePage triggered for URL:', location.href);
+
     try {
-      if (!isEnabled) return;
       const canon = getCanonicalPostUrl(location.href);
       if (!canon) {
         log('Not a post page, skipping:', location.href);
-        processingPage = false;
-        return;
+        return; // No finally block needed here, processingPage is handled below
       }
 
       const lastCanonical = await store.get(KEY_LAST_URL, null);
       if (canon === lastCanonical) {
         log('Same post as last time, skipping:', canon);
-        processingPage = false;
         return;
       }
 
@@ -146,17 +154,19 @@
       const key = 'ts_' + canon;
       const last = await store.get(key, 0);
       if (Date.now() - last < COOLDOWN_HOURS * HOUR) {
-        log('cool-down, already saved recently →', canon);
-        processingPage = false;
+        log('Cool-down active, already saved recently →', canon);
         return;
       }
+
       showToast('Submitting to Wayback Machine...');
       await addToArchiveQueue(canon);
-      processArchiveQueue();
+      processArchiveQueue(); // Start processing immediately
+
     } catch (err) {
-      console.error('[Wayback-archiver] Error:', err);
+      console.error('[Wayback-archiver] Error in handlePage:', err);
     } finally {
       processingPage = false;
+      log('Finished page processing.');
     }
   }
 
@@ -198,39 +208,17 @@
     });
   }
 
-  // =================================================================
-  // ========== FIXED FUNCTION =======================================
-  // =================================================================
-  /**
-   * This function has been rewritten to be more robust.
-   * It now uses a simpler regex that can find the post ID from multiple
-   * different URL structures used by Reddit's modern interface.
-   */
+  /* ---------- canonicalisation ---------- */
   function getCanonicalPostUrl(href) {
     try {
       const url = new URL(href);
-
-      // Handle redd.it shortlinks first, as they are unambiguous.
       if (url.hostname === 'redd.it') {
         const postId = url.pathname.replace(/^\/|\/$/g, '');
-        if (postId) {
-          // old.reddit.com/comments/ID is a stable, canonical link that will redirect.
-          return `https://old.reddit.com/comments/${postId}`;
-        }
+        return postId ? `https://old.reddit.com/comments/${postId}` : null;
       }
-
-      // This robust regex finds the post ID from various path structures:
-      // - /r/subreddit/comments/post_id/post_title/
-      // - /comments/post_id/
-      // - /gallery/post_id
       const match = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
-
       if (match && match[1]) {
-        const postId = match[1];
-        // We create a canonical link that old.reddit.com understands.
-        // It will automatically redirect to the full, correct URL,
-        // so we don't need to parse the subreddit from the path.
-        return `https://old.reddit.com/comments/${postId}`;
+        return `https://old.reddit.com/comments/${match[1]}`;
       }
     } catch (e) {
       console.error('[Wayback-archiver] Error parsing URL:', href, e);
@@ -239,38 +227,63 @@
     return null;
   }
 
-  /* ---------- SPA navigation hook ---------- */
+  // =================================================================
+  // ========== FIXED FUNCTION =======================================
+  // =================================================================
+  /**
+   * This function has been rewritten to be more robust. It now handles
+   * the initial page load separately from subsequent SPA navigations
+   * to avoid race conditions.
+   */
   function setupNavHooks() {
+    log('Setting up navigation hooks...');
+
+    // Debounced handler for SPA navigation events (clicks, back/forward)
     const debouncedHandlePage = (() => {
         let timer;
         return () => {
             clearTimeout(timer);
-            timer = setTimeout(handlePage, 250);
+            timer = setTimeout(handlePage, 300); // Slightly increased delay
         };
     })();
 
+    // Hook into history changes for SPA navigation
     const origPushState = history.pushState;
     history.pushState = function(...args) {
+        log('history.pushState detected');
         origPushState.apply(this, args);
         debouncedHandlePage();
     };
 
     const origReplaceState = history.replaceState;
     history.replaceState = function(...args) {
+        log('history.replaceState detected');
         origReplaceState.apply(this, args);
         debouncedHandlePage();
     };
 
-    window.addEventListener('popstate', debouncedHandlePage);
+    window.addEventListener('popstate', () => {
+        log('popstate event detected');
+        debouncedHandlePage();
+    });
 
+    // Handle the very first page load
     if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', debouncedHandlePage);
+        document.addEventListener('DOMContentLoaded', () => {
+            log('DOMContentLoaded event fired, running initial handlePage.');
+            // We call this directly, without debounce, to ensure it runs.
+            // The `processingPage` flag will prevent collisions.
+            setTimeout(handlePage, 500); // A small delay to let Reddit's UI settle.
+        });
     } else {
-      debouncedHandlePage();
+        log('Document already loaded, running initial handlePage.');
+        setTimeout(handlePage, 500);
     }
 
+    // Periodically process the queue in the background
     setInterval(processArchiveQueue, 60000);
   }
 
+  log('Userscript injected.');
   setupNavHooks();
 })();
