@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.5.1
+// @version      1.5.2
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -68,7 +68,6 @@
   store.get(KEY_GLOBAL, ENABLED_DEFAULT).then(val => {
     isEnabled = !!val;
     log(`Script status loaded. Enabled: ${isEnabled}`);
-    processArchiveQueue();
   });
 
   GM.registerMenuCommand('Toggle auto-archiving', async () => {
@@ -105,8 +104,7 @@
     try {
       const success = await submitToWayback(item.url);
       if (success) {
-        const key = 'ts_' + item.url;
-        await store.set(key, Date.now());
+        await store.set('ts_' + item.url, Date.now());
         log('Successfully archived and set cooldown for:', item.url);
       } else {
         log('Failed to archive, will retry later:', item.url);
@@ -121,25 +119,30 @@
   }
 
   /* ---------- main work ---------- */
-  let processingPage = false;
+  let processingUrl = '';
 
   async function handlePage() {
     if (!isEnabled) {
       log('Handler called, but script is disabled. Aborting.');
       return;
     }
-    if (processingPage) {
-      log('Handler called, but a page is already being processed. Aborting.');
+    
+    // Use the current URL as a processing lock to prevent re-runs
+    const currentUrl = location.href;
+    if (processingUrl === currentUrl) {
+      log('Handler called, but this URL is already being processed. Aborting.');
       return;
     }
-    processingPage = true;
-    log('handlePage triggered for URL:', location.href);
+    processingUrl = currentUrl;
+    log('handlePage triggered for URL:', currentUrl);
 
     try {
-      const canon = getCanonicalPostUrl(location.href);
+      const canon = getCanonicalPostUrl(currentUrl);
       if (!canon) {
-        log('Not a post page, skipping:', location.href);
-        return; // No finally block needed here, processingPage is handled below
+        log('Not a post page, skipping:', currentUrl);
+        // Clear the last post URL when we navigate to a non-post page
+        await store.set(KEY_LAST_URL, '');
+        return;
       }
 
       const lastCanonical = await store.get(KEY_LAST_URL, null);
@@ -151,9 +154,8 @@
       await store.set(KEY_LAST_URL, canon);
       log('New post detected:', canon);
 
-      const key = 'ts_' + canon;
-      const last = await store.get(key, 0);
-      if (Date.now() - last < COOLDOWN_HOURS * HOUR) {
+      const lastTimestamp = await store.get('ts_' + canon, 0);
+      if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
         log('Cool-down active, already saved recently →', canon);
         return;
       }
@@ -165,8 +167,14 @@
     } catch (err) {
       console.error('[Wayback-archiver] Error in handlePage:', err);
     } finally {
-      processingPage = false;
-      log('Finished page processing.');
+      // Release the lock for this specific URL after a short delay
+      // to allow all related events to finish.
+      setTimeout(() => {
+        if (processingUrl === currentUrl) {
+          processingUrl = '';
+        }
+      }, 500);
+      log('Finished page processing logic for:', currentUrl);
     }
   }
 
@@ -175,23 +183,14 @@
     const saveUrl = 'https://web.archive.org/save/' + encodeURIComponent(url);
     return new Promise(res => {
       GM.xmlHttpRequest({
-        method : 'GET',
-        url    : saveUrl,
+        method: 'GET',
+        url: saveUrl,
         timeout: 60000,
-        onload : r => {
-          if (r.status === 520) {
-            console.error('Wayback response 520: Server error. Likely rate-limited.', url);
-            showToast('Wayback Machine is busy. Will retry later.');
-            res(false);
-            return;
-          }
+        onload: r => {
           const success = r.status >= 200 && r.status < 400;
+          if (r.status === 520) console.error('Wayback response 520: Server error. Likely rate-limited.', url);
           log('Wayback response', r.status, url);
-          if (success) {
-            showToast('Successfully archived to Wayback Machine!');
-          } else {
-            showToast('Failed to archive. Will retry later.');
-          }
+          showToast(success ? 'Successfully archived to Wayback Machine!' : 'Failed to archive. Will retry later.');
           res(success);
         },
         onerror: e => {
@@ -217,70 +216,52 @@
         return postId ? `https://old.reddit.com/comments/${postId}` : null;
       }
       const match = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
-      if (match && match[1]) {
-        return `https://old.reddit.com/comments/${match[1]}`;
-      }
+      return (match && match[1]) ? `https://old.reddit.com/comments/${match[1]}` : null;
     } catch (e) {
-      console.error('[Wayback-archiver] Error parsing URL:', href, e);
       return null;
     }
-    return null;
   }
 
   // =================================================================
-  // ========== FIXED FUNCTION =======================================
+  // ========== FINALIZED & ROBUST HOOK SETUP ========================
   // =================================================================
-  /**
-   * This function has been rewritten to be more robust. It now handles
-   * the initial page load separately from subsequent SPA navigations
-   * to avoid race conditions.
-   */
   function setupNavHooks() {
-    log('Setting up navigation hooks...');
+    log('Setting up unified navigation hooks...');
 
-    // Debounced handler for SPA navigation events (clicks, back/forward)
+    // A single, debounced handler for ALL navigation-style events.
+    // This correctly handles the initial page load and subsequent SPA
+    // navigations without race conditions.
     const debouncedHandlePage = (() => {
         let timer;
         return () => {
             clearTimeout(timer);
-            timer = setTimeout(handlePage, 300); // Slightly increased delay
+            timer = setTimeout(handlePage, 350); // A safe delay
         };
     })();
 
-    // Hook into history changes for SPA navigation
+    // Hook into all events that signify a page change.
+    // 1. For SPA navigation via links
     const origPushState = history.pushState;
     history.pushState = function(...args) {
-        log('history.pushState detected');
         origPushState.apply(this, args);
         debouncedHandlePage();
     };
 
+    // 2. For SPA navigation that rewrites URL (e.g., on initial load)
     const origReplaceState = history.replaceState;
     history.replaceState = function(...args) {
-        log('history.replaceState detected');
         origReplaceState.apply(this, args);
         debouncedHandlePage();
     };
 
-    window.addEventListener('popstate', () => {
-        log('popstate event detected');
-        debouncedHandlePage();
-    });
+    // 3. For browser back/forward button
+    window.addEventListener('popstate', debouncedHandlePage);
 
-    // Handle the very first page load
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => {
-            log('DOMContentLoaded event fired, running initial handlePage.');
-            // We call this directly, without debounce, to ensure it runs.
-            // The `processingPage` flag will prevent collisions.
-            setTimeout(handlePage, 500); // A small delay to let Reddit's UI settle.
-        });
-    } else {
-        log('Document already loaded, running initial handlePage.');
-        setTimeout(handlePage, 500);
-    }
+    // 4. For the very first page load. We treat it just like any other
+    //    navigation event and funnel it into the same debouncer.
+    debouncedHandlePage();
 
-    // Periodically process the queue in the background
+    // Periodically process the archive queue in the background
     setInterval(processArchiveQueue, 60000);
   }
 
