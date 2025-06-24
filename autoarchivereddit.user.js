@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.7.4
+// @version      1.7.5
 // @description  A robust script to auto-submit Reddit posts to the Wayback Machine. Fixes critical syntax error.
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -77,31 +77,34 @@
   async function processArchiveQueue() {
     if (isQueueProcessing) { log('Queue is already being processed. Skipping.'); return; }
     if (!isEnabled) return;
-    
+
     const tasksToProcess = await store.get(KEY_QUEUE, []);
     if (tasksToProcess.length === 0) return;
 
     isQueueProcessing = true;
     log(`Acquired lock. Processing a batch of ${tasksToProcess.length} items.`);
-    
+
     const succeededUrls = [];
 
     try {
-      for (const item of tasksToProcess) {
+      // MODIFICATION: Changed to a `for...of` loop with `.entries()` to get the index.
+      for (const [i, item] of tasksToProcess.entries()) {
+        const logPrefix = `[${i + 1}/${tasksToProcess.length}]`;
+
         if (!item || typeof item.url !== 'string') {
-            console.error('[Wayback-archiver] Found and will remove a corrupted item.', item);
+            console.error('[Wayback-archiver]', logPrefix, 'Found and will remove a corrupted item.', item);
             if (item && item.url) succeededUrls.push(item.url); // Use its own URL to remove if possible
             continue;
         }
 
-        log('Attempting to archive:', item.url);
+        log(logPrefix, 'Attempting to archive:', item.url);
         const success = await submitToWayback(item.url);
         if (success) {
-            log('Archive successful for:', item.url);
+            log(logPrefix, 'Archive successful for:', item.url);
             await store.set('ts_' + item.url, Date.now());
             succeededUrls.push(item.url);
         } else {
-            log('Archive failed, item will remain in queue for next run.', item.url);
+            log(logPrefix, 'Archive failed, item will remain in queue for next run.', item.url);
         }
       }
     } catch (err) {
@@ -170,8 +173,8 @@
   function getCanonicalPostUrl(href) {
     try {
       const url = new URL(href);
-      if (url.hostname === 'redd.it') { 
-        const p = url.pathname.replace(/^\/|\/$/g, ''); 
+      if (url.hostname === 'redd.it') {
+        const p = url.pathname.replace(/^\/|\/$/g, '');
         return p ? `https://old.reddit.com/comments/${p}` : null;
       }
       // **THE CRITICAL FIX IS HERE**: [a-z0-9] is the correct syntax.
