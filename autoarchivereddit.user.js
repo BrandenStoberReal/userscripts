@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.5.2
+// @version      1.6.0
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -119,28 +119,19 @@
   }
 
   /* ---------- main work ---------- */
-  let processingUrl = '';
-
   async function handlePage() {
     if (!isEnabled) {
       log('Handler called, but script is disabled. Aborting.');
       return;
     }
     
-    // Use the current URL as a processing lock to prevent re-runs
     const currentUrl = location.href;
-    if (processingUrl === currentUrl) {
-      log('Handler called, but this URL is already being processed. Aborting.');
-      return;
-    }
-    processingUrl = currentUrl;
     log('handlePage triggered for URL:', currentUrl);
 
     try {
       const canon = getCanonicalPostUrl(currentUrl);
       if (!canon) {
         log('Not a post page, skipping:', currentUrl);
-        // Clear the last post URL when we navigate to a non-post page
         await store.set(KEY_LAST_URL, '');
         return;
       }
@@ -162,19 +153,9 @@
 
       showToast('Submitting to Wayback Machine...');
       await addToArchiveQueue(canon);
-      processArchiveQueue(); // Start processing immediately
-
+      processArchiveQueue();
     } catch (err) {
       console.error('[Wayback-archiver] Error in handlePage:', err);
-    } finally {
-      // Release the lock for this specific URL after a short delay
-      // to allow all related events to finish.
-      setTimeout(() => {
-        if (processingUrl === currentUrl) {
-          processingUrl = '';
-        }
-      }, 500);
-      log('Finished page processing logic for:', currentUrl);
     }
   }
 
@@ -223,45 +204,63 @@
   }
 
   // =================================================================
-  // ========== FINALIZED & ROBUST HOOK SETUP ========================
+  // ========== ROBUST NAVIGATION HOOK VIA SCRIPT INJECTION ==========
   // =================================================================
-  function setupNavHooks() {
-    log('Setting up unified navigation hooks...');
+  /**
+   * Injects a script into the page's context to reliably listen for
+   * history changes, bypassing the userscript sandbox limitations.
+   * When a navigation occurs, it dispatches a custom event that our
+   * sandboxed script can listen for.
+   */
+  function injectNavigationListener() {
+    const SCRIPT_ID = 'history-hook-script';
+    const EVENT_NAME = 'wayback_history_changed';
+    
+    if (document.getElementById(SCRIPT_ID)) return;
 
-    // A single, debounced handler for ALL navigation-style events.
-    // This correctly handles the initial page load and subsequent SPA
-    // navigations without race conditions.
+    const script = document.createElement('script');
+    script.id = SCRIPT_ID;
+    script.textContent = `
+      (() => {
+        const dispatchHistoryChangeEvent = () => {
+          window.dispatchEvent(new CustomEvent('${EVENT_NAME}'));
+        };
+        const originalPushState = history.pushState;
+        history.pushState = function(...args) {
+          originalPushState.apply(this, args);
+          dispatchHistoryChangeEvent();
+        };
+        const originalReplaceState = history.replaceState;
+        history.replaceState = function(...args) {
+          originalReplaceState.apply(this, args);
+          dispatchHistoryChangeEvent();
+        };
+        // Also listen for back/forward browser buttons
+        window.addEventListener('popstate', dispatchHistoryChangeEvent);
+      })();
+    `;
+    (document.head || document.documentElement).appendChild(script);
+    script.remove(); // Clean up the script tag from the DOM after it has run
+    log('Navigation listener injected into page context.');
+  }
+
+  function setupNavHooks() {
+    injectNavigationListener();
+
     const debouncedHandlePage = (() => {
         let timer;
         return () => {
             clearTimeout(timer);
-            timer = setTimeout(handlePage, 350); // A safe delay
+            timer = setTimeout(handlePage, 500); // A generous delay
         };
     })();
 
-    // Hook into all events that signify a page change.
-    // 1. For SPA navigation via links
-    const origPushState = history.pushState;
-    history.pushState = function(...args) {
-        origPushState.apply(this, args);
-        debouncedHandlePage();
-    };
+    // Listen for the custom event dispatched by our injected script
+    window.addEventListener('wayback_history_changed', debouncedHandlePage);
 
-    // 2. For SPA navigation that rewrites URL (e.g., on initial load)
-    const origReplaceState = history.replaceState;
-    history.replaceState = function(...args) {
-        origReplaceState.apply(this, args);
-        debouncedHandlePage();
-    };
-
-    // 3. For browser back/forward button
-    window.addEventListener('popstate', debouncedHandlePage);
-
-    // 4. For the very first page load. We treat it just like any other
-    //    navigation event and funnel it into the same debouncer.
+    // Run once on initial load
     debouncedHandlePage();
-
-    // Periodically process the archive queue in the background
+    
     setInterval(processArchiveQueue, 60000);
   }
 
