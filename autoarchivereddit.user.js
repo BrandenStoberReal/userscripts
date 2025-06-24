@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.6.1
+// @version      1.6.2
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -76,7 +76,10 @@
     alert(`Reddit → Wayback auto-archiver is now ${isEnabled ? 'ENABLED' : 'DISABLED'}.`);
   });
 
+
   /* ---------- Archive Queue System ---------- */
+  let isQueueProcessing = false; // The new processing lock
+
   async function addToArchiveQueue(url) {
     const queue = await store.get(KEY_QUEUE, []);
     if (!queue.some(item => item.url === url)) {
@@ -98,55 +101,50 @@
   }
 
   // =================================================================
-  // ========== FIXED FUNCTION =======================================
+  // ========== FIXED FUNCTION WITH PROCESSING LOCK ==================
   // =================================================================
-  /**
-   * This function has been rewritten to be more robust. It now only
-   * removes an item from the queue after a SUCCESSFUL archive.
-   * If an archive fails, the item remains in the queue to be retried later.
-   */
   async function processArchiveQueue() {
+    // 1. Check if a process is already running. If so, exit.
+    if (isQueueProcessing) {
+      log('Queue is already being processed. Skipping this run.');
+      return;
+    }
     if (!isEnabled) return;
     const queue = await store.get(KEY_QUEUE, []);
     if (queue.length === 0) return;
 
-    log(`Processing archive queue (${queue.length} items)...`);
-    const item = queue[0];
+    // 2. Acquire the lock to prevent other calls from running.
+    isQueueProcessing = true;
+    log('Acquired queue processing lock.');
 
     try {
+      log(`Processing archive queue (${queue.length} items)...`);
+      const item = queue[0];
       const success = await submitToWayback(item.url);
 
       if (success) {
         log('Archive successful for:', item.url);
-        // 1. Set the long-term cooldown timestamp. THIS IS THE KEY FIX.
         await store.set('ts_' + item.url, Date.now());
         log('Set 24-hour cooldown for:', item.url);
-
-        // 2. Remove the item from the queue now that it's done.
         await removeFromArchiveQueue(item.url);
-
       } else {
         log('Archive failed, will retry later:', item.url);
-        // On failure, we DO NOT remove the item from the queue.
-        // It will be retried automatically by the setInterval.
       }
     } catch (err) {
       console.error('[Wayback-archiver] Error processing queue item:', err);
-      // Also do nothing, let it be retried.
+    } finally {
+      // 3. ALWAYS release the lock, ensuring the function can run again later.
+      isQueueProcessing = false;
+      log('Released queue processing lock.');
     }
   }
 
 
   /* ---------- main work ---------- */
   async function handlePage() {
-    if (!isEnabled) {
-      log('Handler called, but script is disabled. Aborting.');
-      return;
-    }
-
+    if (!isEnabled) return;
     const currentUrl = location.href;
     log('handlePage triggered for URL:', currentUrl);
-
     try {
       const canon = getCanonicalPostUrl(currentUrl);
       if (!canon) {
@@ -154,28 +152,21 @@
         await store.set(KEY_LAST_URL, '');
         return;
       }
-
       const lastCanonical = await store.get(KEY_LAST_URL, null);
       if (canon === lastCanonical) {
         log('Same post as last time, skipping:', canon);
         return;
       }
-
-      // Check for the 24-hour cooldown BEFORE adding to the queue.
       const lastTimestamp = await store.get('ts_' + canon, 0);
       if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
         log('Cool-down active, already saved recently →', canon);
-        // Also update KEY_LAST_URL here to prevent re-triggering on minor URL changes
         await store.set(KEY_LAST_URL, canon);
         return;
       }
-
       await store.set(KEY_LAST_URL, canon);
       log('New post detected:', canon);
-
       await addToArchiveQueue(canon);
-      processArchiveQueue(); // Start processing immediately
-
+      processArchiveQueue();
     } catch (err) {
       console.error('[Wayback-archiver] Error in handlePage:', err);
     }
@@ -186,26 +177,16 @@
     const saveUrl = 'https://web.archive.org/save/' + encodeURIComponent(url);
     return new Promise(res => {
       GM.xmlHttpRequest({
-        method: 'GET',
-        url: saveUrl,
-        timeout: 60000,
+        method: 'GET', url: saveUrl, timeout: 60000,
         onload: r => {
           const success = r.status >= 200 && r.status < 400;
           if (r.status === 520) console.error('Wayback response 520: Server error. Likely rate-limited.', url);
           log('Wayback response', r.status, url);
-          showToast(success ? 'Successfully archived to Wayback Machine!' : 'Failed to archive. Will retry later.');
+          showToast(success ? 'Successfully archived!' : 'Archive failed, will retry.');
           res(success);
         },
-        onerror: e => {
-          console.error('Wayback XHR error', e);
-          showToast('Error connecting to Wayback Machine. Will retry later.');
-          res(false);
-        },
-        ontimeout: () => {
-          console.error('Wayback XHR timeout');
-          showToast('Wayback Machine request timed out. Will retry later.');
-          res(false);
-        }
+        onerror: e => { console.error('Wayback XHR error', e); showToast('Error connecting. Will retry.'); res(false); },
+        ontimeout: () => { console.error('Wayback XHR timeout'); showToast('Request timed out. Will retry.'); res(false); }
       });
     });
   }
@@ -220,28 +201,23 @@
       }
       const match = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
       return (match && match[1]) ? `https://old.reddit.com/comments/${match[1]}` : null;
-    } catch (e) {
-      return null;
-    }
+    } catch (e) { return null; }
   }
 
   /* ---------- ROBUST NAVIGATION HOOK VIA SCRIPT INJECTION ---------- */
   function injectNavigationListener() {
-    const SCRIPT_ID = 'history-hook-script';
-    const EVENT_NAME = 'wayback_history_changed';
+    const SCRIPT_ID = 'history-hook-script', EVENT_NAME = 'wayback_history_changed';
     if (document.getElementById(SCRIPT_ID)) return;
-    const script = document.createElement('script');
-    script.id = SCRIPT_ID;
+    const script = document.createElement('script'); script.id = SCRIPT_ID;
     script.textContent = `(() => {
-        const dispatch = () => window.dispatchEvent(new CustomEvent('${EVENT_NAME}'));
-        const oPush = history.pushState, oRepl = history.replaceState;
-        history.pushState = function(...a) { oPush.apply(this, a); dispatch(); };
-        history.replaceState = function(...a) { oRepl.apply(this, a); dispatch(); };
-        window.addEventListener('popstate', dispatch);
+        const d = () => window.dispatchEvent(new CustomEvent('${EVENT_NAME}'));
+        const h = history, p = h.pushState, r = h.replaceState;
+        h.pushState = function(...a) { p.apply(this, a); d(); };
+        h.replaceState = function(...a) { r.apply(this, a); d(); };
+        window.addEventListener('popstate', d);
       })();`;
     (document.head || document.documentElement).appendChild(script);
     script.remove();
-    log('Navigation listener injected into page context.');
   }
 
   function setupNavHooks() {
@@ -252,7 +228,7 @@
     })();
     window.addEventListener('wayback_history_changed', debouncedHandlePage);
     debouncedHandlePage();
-    setInterval(processArchiveQueue, 60000); // Periodically retry failed items
+    setInterval(processArchiveQueue, 60000);
   }
 
   log('Userscript injected.');
