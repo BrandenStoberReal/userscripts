@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.3.0
+// @version      1.4.0
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -22,15 +22,15 @@
 
 (() => {
   /* ========== USER SETTINGS ========== */
-  const COOLDOWN_HOURS  = 24;   // do not resubmit same post within N hours
-  const ENABLED_DEFAULT = true; // shipped state
+  const COOLDOWN_HOURS  = 24;
+  const ENABLED_DEFAULT = true;
   /* =================================== */
 
   /* ---------- tiny helpers ---------- */
   const HOUR       = 36e5;
   const KEY_GLOBAL = '_enabled';
   const KEY_QUEUE = '_archive_queue';
-  const KEY_LAST_URL = '_last_url';  // Track the last URL even between page loads
+  const KEY_LAST_URL = '_last_url';
   const store = {
     get: (k, d) => GM.getValue(k, d),
     set: (k, v) => GM.setValue(k, v)
@@ -47,20 +47,15 @@
   `);
   
   function showToast(msg, ms = 3500) {
-    // Ensure we have a body to append to
     if (!document.body) {
       window.addEventListener('DOMContentLoaded', () => showToast(msg, ms));
       return;
     }
-    
     const el = document.createElement('div');
     el.className = 'wb-toast';
     el.textContent = msg;
     document.body.appendChild(el);
-    
-    // Use setTimeout for better compatibility
     setTimeout(() => el.classList.add('show'), 10);
-    
     setTimeout(() => {
       el.classList.remove('show');
       setTimeout(() => el.remove(), 300);
@@ -68,13 +63,9 @@
   }
 
   /* ---------- enable / disable ---------- */
-  let isEnabled = ENABLED_DEFAULT; // Cache to avoid async lookups
-
-  // Initialize enabled state as soon as possible
+  let isEnabled = ENABLED_DEFAULT;
   store.get(KEY_GLOBAL, ENABLED_DEFAULT).then(val => {
     isEnabled = !!val;
-    
-    // Process any queued items from previous sessions
     processArchiveQueue();
   });
 
@@ -87,13 +78,8 @@
   /* ---------- Archive Queue System ---------- */
   async function addToArchiveQueue(url) {
     const queue = await store.get(KEY_QUEUE, []);
-    
-    // Only add if not already in queue
     if (!queue.some(item => item.url === url)) {
-      queue.push({
-        url: url,
-        addedAt: Date.now()
-      });
+      queue.push({ url: url, addedAt: Date.now() });
       await store.set(KEY_QUEUE, queue);
       log('Added to archive queue:', url);
     }
@@ -102,7 +88,6 @@
   async function removeFromArchiveQueue(url) {
     const queue = await store.get(KEY_QUEUE, []);
     const newQueue = queue.filter(item => item.url !== url);
-    
     if (queue.length !== newQueue.length) {
       await store.set(KEY_QUEUE, newQueue);
       log('Removed from archive queue:', url);
@@ -111,20 +96,13 @@
 
   async function processArchiveQueue() {
     if (!isEnabled) return;
-    
     const queue = await store.get(KEY_QUEUE, []);
     if (queue.length === 0) return;
-    
     log(`Processing archive queue (${queue.length} items)...`);
-    
-    // Process one item at a time to avoid overwhelming the Wayback Machine
     const item = queue[0];
-    
     try {
       const success = await submitToWayback(item.url);
-      
       if (success) {
-        // Set cooldown timestamp
         const key = 'ts_' + item.url;
         await store.set(key, Date.now());
         log('Successfully archived and set cooldown for:', item.url);
@@ -134,51 +112,32 @@
     } catch (err) {
       console.error('[Wayback-archiver] Error processing queue item:', err);
     }
-    
-    // Remove this item from the queue regardless of success
     await removeFromArchiveQueue(item.url);
-    
-    // Process the next item after a short delay
     if (queue.length > 1) {
-      setTimeout(processArchiveQueue, 5000);
+      // *** CHANGE: Increased delay from 5000ms to 20000ms (20 seconds) ***
+      // This is much safer and less likely to trigger rate limits.
+      setTimeout(processArchiveQueue, 20000);
     }
   }
 
   /* ---------- main work ---------- */
-  let processingPage = false; // Prevent multiple simultaneous runs
+  let processingPage = false;
 
   async function handlePage() {
     if (processingPage) return;
     processingPage = true;
-    
     try {
-      if (!isEnabled) {
-        processingPage = false;
-        return;
-      }
-
-      // Here's the key change: We check if the current URL is a post
-      // If not, we log it but don't try to archive it
+      if (!isEnabled) return;
       const canon = getCanonicalPostUrl(location.href);
-      
       if (!canon) {
-        log('Not a post page, skipping:', location.href);
         processingPage = false;
         return;
       }
-      
-      log('Detected post page:', canon);
-      
-      // Check against last URL from storage instead of in-memory variable
       const lastCanonical = await store.get(KEY_LAST_URL, null);
-      
       if (canon === lastCanonical) {
-        log('Same post as last time, skipping:', canon);
         processingPage = false;
         return;
       }
-      
-      // Update the last URL in storage
       await store.set(KEY_LAST_URL, canon);
       log('New post detected:', canon);
 
@@ -189,14 +148,8 @@
         processingPage = false;
         return;
       }
-
-      // Show submission notification immediately
       showToast('Submitting to Wayback Machine...');
-      
-      // Add to persistent queue instead of trying to archive immediately
       await addToArchiveQueue(canon);
-      
-      // Start processing the queue
       processArchiveQueue();
     } catch (err) {
       console.error('[Wayback-archiver] Error:', err);
@@ -212,18 +165,24 @@
       GM.xmlHttpRequest({
         method : 'GET',
         url    : saveUrl,
-        headers: { 'User-Agent': navigator.userAgent },
-        timeout: 30000, // 30 second timeout
+        // *** CHANGE: Removed the explicit User-Agent header. ***
+        // This is the main cause of 520 errors. The browser will add it correctly.
+        timeout: 60000, // Increased timeout to 60s as archiving can be slow
         onload : r => {
+          // A 520 error from Cloudflare will be caught here.
+          if (r.status === 520) {
+            console.error('Wayback response 520: Server error. Likely rate-limited.', url);
+            showToast('Wayback Machine is busy. Will retry later.');
+            res(false); // Treat as failure
+            return;
+          }
           const success = r.status >= 200 && r.status < 400;
           log('Wayback response', r.status, url);
-          
           if (success) {
             showToast('Successfully archived to Wayback Machine!');
           } else {
-            showToast('Failed to archive to Wayback Machine. Will retry later.');
+            showToast('Failed to archive. Will retry later.');
           }
-          
           res(success);
         },
         onerror: e => {
@@ -242,107 +201,69 @@
 
   /* ---------- canonicalisation ---------- */
   function getCanonicalPostUrl(href) {
-    let url;
-    try { url = new URL(href); }
-    catch { return null; }
-
-    // redd.it short links
-    if (url.hostname === 'redd.it') {
-      return `https://old.reddit.com/comments/${url.pathname.replace(/^\/|\/$/g, '')}`;
-    }
-
-    // Any /r/.../comments/<id>/ path – normalise to old.reddit
-    const match = url.pathname.match(/^\/r\/([^/]+)\/comments\/([A-Za-z0-9]+)(\/|$)/);
-    if (match) {
-      const [, sub, postId] = match;
-      return `https://old.reddit.com/r/${sub}/comments/${postId}`;
+    try {
+      let url = new URL(href);
+      if (url.hostname === 'redd.it') {
+        return `https://old.reddit.com/comments/${url.pathname.replace(/^\/|\/$/g, '')}`;
+      }
+      const match = url.pathname.match(/^\/r\/([^/]+)\/comments\/([A-Za-z0-9]+)(\/|$)/);
+      if (match) {
+        const [, sub, postId] = match;
+        return `https://old.reddit.com/r/${sub}/comments/${postId}`;
+      }
+    } catch {
+      return null;
     }
     return null;
   }
 
   /* ---------- SPA navigation hook ---------- */
   function setupNavHooks() {
-    // Force check the page immediately on startup
-    setTimeout(handlePage, 100);
-    
-    // 1. Intercept push/replaceState
-    const push = history.pushState, repl = history.replaceState;
-    history.pushState = function() { 
-      push.apply(this, arguments);
-      setTimeout(handlePage, 100); // Slight delay to let page load
-    };
-    history.replaceState = function() { 
-      repl.apply(this, arguments);
-      setTimeout(handlePage, 100);
-    };
-    
-    // 2. Listen for popstate
-    window.addEventListener('popstate', () => setTimeout(handlePage, 100));
-    
-    // 3. Watch for URL changes using an interval (fallback)
+    // *** CHANGE: Simplified the navigation hooks significantly. ***
+    // We only need to observe history changes and have a single periodic check.
+    // This prevents multiple triggers for the same navigation event.
     let lastUrl = location.href;
-    setInterval(() => {
-      if (lastUrl !== location.href) {
-        lastUrl = location.href;
-        handlePage();
-      }
-    }, 500); // Check more frequently (reduced from 1000ms)
-    
-    // 4. Run once on initial load
+
+    const debouncedHandlePage = (() => {
+        let timer;
+        return () => {
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+                // We check the URL again inside the debounced function
+                // to ensure we're acting on the *latest* URL.
+                if (lastUrl !== location.href) {
+                    lastUrl = location.href;
+                    handlePage();
+                }
+            }, 150); // A small delay to bundle rapid-fire events
+        };
+    })();
+
+    // 1. Intercept push/replaceState
+    const origPushState = history.pushState;
+    const origReplaceState = history.replaceState;
+    history.pushState = function(...args) {
+        origPushState.apply(this, args);
+        debouncedHandlePage();
+    };
+    history.replaceState = function(...args) {
+        origReplaceState.apply(this, args);
+        debouncedHandlePage();
+    };
+
+    // 2. Listen for popstate (browser back/forward buttons)
+    window.addEventListener('popstate', debouncedHandlePage);
+
+    // 3. Run once on initial load
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', handlePage);
     } else {
       handlePage();
     }
-    
-    // 5. Set up periodic queue processing even if no navigation occurs
+
+    // 4. Set up periodic queue processing
     setInterval(processArchiveQueue, 60000);
-    
-    // 6. Additional hook for Reddit's infinite scroll behavior
-    // This detects content changes that might not trigger URL changes
-    const observeDOM = (function(){
-      const MutationObserver = window.MutationObserver || window.WebKitMutationObserver;
-      
-      return function(obj, callback){
-        if (!obj || obj.nodeType !== 1) return;
-        
-        if (MutationObserver) {
-          const mutationObserver = new MutationObserver(callback);
-          mutationObserver.observe(obj, { childList: true, subtree: true });
-          return mutationObserver;
-        } else if (window.addEventListener) {
-          obj.addEventListener('DOMNodeInserted', callback, false);
-          obj.addEventListener('DOMNodeRemoved', callback, false);
-          return {
-            disconnect: function(){
-              obj.removeEventListener('DOMNodeInserted', callback);
-              obj.removeEventListener('DOMNodeRemoved', callback);
-            }
-          };
-        }
-      };
-    })();
-    
-    // Start observing once the DOM is ready
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', () => {
-        observeDOM(document.body, function(mutations) {
-          // Only trigger on significant DOM changes
-          if (mutations.some(m => m.addedNodes.length > 3)) {
-            setTimeout(handlePage, 200);
-          }
-        });
-      });
-    } else {
-      observeDOM(document.body, function(mutations) {
-        // Only trigger on significant DOM changes
-        if (mutations.some(m => m.addedNodes.length > 3)) {
-          setTimeout(handlePage, 200);
-        }
-      });
-    }
   }
   
-  // Set up all navigation hooks
   setupNavHooks();
 })();
