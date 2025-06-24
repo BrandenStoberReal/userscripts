@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.4.1
+// @version      1.4.2
 // @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
 // @author       Branden Stober
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -114,7 +114,7 @@
     }
     await removeFromArchiveQueue(item.url);
     if (queue.length > 1) {
-      setTimeout(processArchiveQueue, 20000); // 20 second delay between requests
+      setTimeout(processArchiveQueue, 20000);
     }
   }
 
@@ -218,18 +218,14 @@
 
   /* ---------- SPA navigation hook ---------- */
   function setupNavHooks() {
-    // *** CHANGE: Corrected the navigation hook logic. ***
-    // This debouncer now correctly calls handlePage without performing its own
-    // faulty URL check. It simply prevents handlePage from firing too rapidly.
     const debouncedHandlePage = (() => {
         let timer;
         return () => {
             clearTimeout(timer);
-            timer = setTimeout(handlePage, 250); // Use a 250ms debounce delay
+            timer = setTimeout(handlePage, 250);
         };
     })();
 
-    // 1. Intercept push/replaceState for SPA navigation
     const origPushState = history.pushState;
     history.pushState = function(...args) {
         origPushState.apply(this, args);
@@ -242,17 +238,18 @@
         debouncedHandlePage();
     };
 
-    // 2. Listen for popstate (browser back/forward buttons)
     window.addEventListener('popstate', debouncedHandlePage);
 
-    // 3. Run once on initial page load
+    // *** CHANGE: Initial page load now uses the debouncer. ***
+    // This prevents the race condition where handlePage runs twice,
+    // once immediately and once from a history event, causing it to
+    // incorrectly flag the page as a duplicate of itself.
     if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', handlePage);
+      document.addEventListener('DOMContentLoaded', debouncedHandlePage);
     } else {
-      handlePage();
+      debouncedHandlePage();
     }
     
-    // 4. Periodically process the queue in case of missed events
     setInterval(processArchiveQueue, 60000);
   }
   
