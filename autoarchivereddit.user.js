@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Reddit → Wayback auto-archiver
 // @namespace    reddit-wayback-autosave
-// @version      1.6.5
-// @description  Auto-submit every Reddit post you visit to the Wayback Machine (works with SPA navigation).
+// @version      1.7.0
+// @description  A robust script to auto-submit Reddit posts to the Wayback Machine, with a self-healing queue.
 // @author       Branden Stober (fixed by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -67,7 +67,7 @@
 
   async function addToArchiveQueue(url) {
     const queue = await store.get(KEY_QUEUE, []);
-    if (!queue.some(item => item.url === url)) {
+    if (!queue.some(item => item && item.url === url)) {
       queue.push({ url: url, addedAt: Date.now() });
       await store.set(KEY_QUEUE, queue);
       log('Added to archive queue:', url);
@@ -75,53 +75,48 @@
   }
 
   // =================================================================
-  // ========== FINAL, ROBUST QUEUE PROCESSING LOGIC =================
+  // ========== FINAL, BULLETPROOF QUEUE PROCESSING LOGIC ============
   // =================================================================
   async function processArchiveQueue() {
     if (isQueueProcessing) { log('Queue is already being processed. Skipping.'); return; }
     if (!isEnabled) return;
-
-    // Get the item to process WITHOUT modifying the queue yet
-    const initialQueue = await store.get(KEY_QUEUE, []);
-    if (initialQueue.length === 0) return;
-    const itemToProcess = initialQueue[0];
+    
+    let queue = await store.get(KEY_QUEUE, []);
+    if (queue.length === 0) return;
 
     isQueueProcessing = true;
-    log('Acquired queue processing lock for item:', itemToProcess.url);
+    const item = queue.shift(); // Take item off the front immediately.
+
+    // **CRITICAL FIX: VALIDATE THE QUEUE ITEM**
+    // This detects corruption and prevents the 'undefined' error.
+    if (!item || typeof item.url !== 'string' || item.url.length === 0) {
+        console.error('[Wayback-archiver] CRITICAL: Found corrupted item in queue. Discarding it.', item);
+        await store.set(KEY_QUEUE, queue); // Save the queue without the bad item.
+        isQueueProcessing = false; // Release the lock.
+        // Immediately try to process the next item if there is one.
+        if (queue.length > 0) setTimeout(processArchiveQueue, 10); 
+        return;
+    }
+
+    log('Acquired lock. Processing item:', item.url);
 
     try {
-      const success = await submitToWayback(itemToProcess.url);
-
-      // **CRITICAL FIX**: After the long task is done, get a FRESH copy of the queue.
-      // This ensures we don't overwrite changes made by addToArchiveQueue while we were waiting.
-      const currentQueue = await store.get(KEY_QUEUE, []);
-      let finalQueue;
-
-      if (success) {
-        log('Archive successful. Removing item from queue.', itemToProcess.url);
-        // Create the new queue by filtering out the successfully processed item.
-        finalQueue = currentQueue.filter(item => item.url !== itemToProcess.url);
-        await store.set('ts_' + itemToProcess.url, Date.now());
-      } else {
-        log('Archive failed. Rotating item to back of queue.', itemToProcess.url);
-        // Create the new queue by filtering the item and re-adding it at the end.
-        finalQueue = currentQueue.filter(item => item.url !== itemToProcess.url);
-        finalQueue.push(itemToProcess);
-      }
-      
-      // Now, save the correctly modified queue.
-      await store.set(KEY_QUEUE, finalQueue);
-
+        const success = await submitToWayback(item.url);
+        if (success) {
+            log('Archive successful, item permanently removed.', item.url);
+            await store.set('ts_' + item.url, Date.now());
+        } else {
+            log('Archive failed, adding item to back of queue.', item.url);
+            queue.push(item); // Add the validated item back to the end.
+        }
     } catch (err) {
-      console.error('[Wayback-archiver] Critical error during processing. Item will be rotated.', err);
-      // Even on a critical error, we still rotate to prevent getting stuck.
-      const currentQueue = await store.get(KEY_QUEUE, []);
-      const finalQueue = currentQueue.filter(item => item.url !== itemToProcess.url);
-      finalQueue.push(itemToProcess);
-      await store.set(KEY_QUEUE, finalQueue);
+        console.error('[Wayback-archiver] Error processing item. It will be re-added to queue.', err);
+        queue.push(item); // Also re-add on critical error.
     } finally {
-      isQueueProcessing = false;
-      log('Released queue processing lock.');
+        // Always save the modified queue (either shorter or rotated).
+        await store.set(KEY_QUEUE, queue);
+        isQueueProcessing = false;
+        log('Released lock.');
     }
   }
 
@@ -129,15 +124,14 @@
   async function handlePage() {
     if (!isEnabled) return;
     const currentUrl = location.href;
-    log('handlePage triggered for URL:', currentUrl);
     try {
       const canon = getCanonicalPostUrl(currentUrl);
-      if (!canon) { log('Not a post page, skipping.', currentUrl); await store.set(KEY_LAST_URL, ''); return; }
+      if (!canon) { await store.set(KEY_LAST_URL, ''); return; }
       const lastCanonical = await store.get(KEY_LAST_URL, null);
-      if (canon === lastCanonical) { log('Same post as last time, skipping.', canon); return; }
+      if (canon === lastCanonical) return;
       const lastTimestamp = await store.get('ts_' + canon, 0);
       if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
-        log('Cool-down active, already saved recently →', canon);
+        log('Cool-down active for:', canon);
         await store.set(KEY_LAST_URL, canon);
         return;
       }
