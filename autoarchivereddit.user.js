@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback Auto-Archiver (v4.3 Final)
+// @name         Reddit → Wayback Auto-Archiver (v5.0 Final)
 // @namespace    reddit-wayback-autosave
-// @version      4.3.0
-// @description  A clean, stable, and robust script to auto-submit Reddit posts and their content. With a functional parser for embedded content.
+// @version      5.0.0
+// @description  A refactored, stable, and fully functional script to auto-submit Reddit posts and their content. Handles all known embed types.
 // @author       Branden Stober (refactored by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -108,7 +108,9 @@ class RedditArchiver {
                 contentUrls.forEach(url => urlsToArchive.add(url));
             }
 
-            this.log(`Found ${urlsToArchive.size} total URLs to queue.`);
+            if (urlsToArchive.size > 1) {
+                this.log(`Found ${urlsToArchive.size - 1} content URLs.`);
+            }
             for (const url of urlsToArchive) {
                 await this.addToQueue(url);
             }
@@ -127,8 +129,10 @@ class RedditArchiver {
             const postContainer = revealButton.closest('shreddit-post, div.thing');
             if (!postContainer) return;
 
-            this.log('Sensitive content reveal clicked. Waiting for content...');
-            setTimeout(async () => {
+            this.log('Sensitive content reveal clicked. Waiting for new content...');
+            const newMediaElement = await this.waitForElement('iframe[src], shreddit-embed[html]', postContainer, 5000);
+            
+            if (newMediaElement) {
                 const newUrls = this.extractUrlsFromContainer(postContainer);
                 if (newUrls.length > 0) {
                     this.log('Found new content post-click:', newUrls);
@@ -137,7 +141,9 @@ class RedditArchiver {
                     }
                     this.processQueue();
                 }
-            }, 1500);
+            } else {
+                this.log('Could not find new iframe or embed after click.');
+            }
         }
     }
 
@@ -155,7 +161,7 @@ class RedditArchiver {
         container.querySelectorAll(selectors).forEach(el => {
             let potentialUrl = null;
 
-            if (el.tagName === 'SHREDDIT-EMBED' && el.hasAttribute('html')) {
+            if (el.tagName === 'SHREDDIT-EMBED') {
                 const htmlString = el.getAttribute('html');
                 const srcMatch = htmlString.match(/src="([^"]+)"/);
                 if (srcMatch && srcMatch[1]) {
@@ -193,8 +199,7 @@ class RedditArchiver {
 
         this.state.isQueueProcessing = true;
         this.log(`Starting batch processing of ${tasks.length} items.`);
-        const succeededUrls = [];
-        const failedUrls = [];
+        const succeededUrls = [], failedUrls = [];
 
         try {
             for (const item of tasks) {
