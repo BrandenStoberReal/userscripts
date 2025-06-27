@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback Auto-Archiver (v5.0 Final)
+// @name         Reddit → Wayback Auto-Archiver (v5.1 Final)
 // @namespace    reddit-wayback-autosave
-// @version      5.0.0
-// @description  A refactored, stable, and fully functional script to auto-submit Reddit posts and their content. Handles all known embed types.
+// @version      5.1.0
+// @description  A refactored, stable, and fully functional script to auto-submit Reddit posts and their content. With enhanced logging.
 // @author       Branden Stober (refactored by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -204,8 +204,11 @@ class RedditArchiver {
         try {
             for (const item of tasks) {
                 if (!item || typeof item.url !== 'string') continue;
-                const success = await this.submitToWayback(item.url);
-                if (success) {
+                
+                const result = await this.submitToWayback(item.url);
+                this.log(`Processed: ${item.url} | Status: ${result.statusCode}`);
+
+                if (result.success) {
                     await GM.setValue('ts_' + item.url, Date.now());
                     succeededUrls.push(item.url);
                 } else {
@@ -233,9 +236,9 @@ class RedditArchiver {
                 method: 'GET',
                 url: saveUrl,
                 timeout: 60000,
-                onload: r => resolve(r.status >= 200 && r.status < 400),
-                onerror: () => resolve(false),
-                ontimeout: () => resolve(false),
+                onload: r => resolve({ success: r.status >= 200 && r.status < 400, statusCode: r.status }),
+                onerror: () => resolve({ success: false, statusCode: 0 }),
+                ontimeout: () => resolve({ success: false, statusCode: -1 }),
             });
         });
     }
