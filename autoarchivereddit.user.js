@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback auto-archiver (Improved v2.4)
+// @name         Reddit → Wayback auto-archiver (v2.5 Final)
 // @namespace    reddit-wayback-autosave
-// @version      2.4.0
-// @description  A robust script to auto-submit Reddit posts and their content. Fixes post detection regression.
+// @version      2.5.0
+// @description  A robust script to auto-submit Reddit posts and their content. Correctly handles SPA navigation, cooldowns, and interactive content.
 // @author       Branden Stober (fixed by AI, improved by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -31,6 +31,7 @@
   const HOUR       = 36e5;
   const KEY_GLOBAL = '_enabled';
   const KEY_QUEUE = '_archive_queue';
+  const KEY_LAST_CANONICAL = '_last_canonical_url'; // Restored for SPA navigation
   const store = {
     get: (k, d) => GM.getValue(k, d),
     set: (k, v) => GM.setValue(k, v)
@@ -75,15 +76,14 @@
   }
 
   async function processArchiveQueue() {
-    if (isQueueProcessing) { return; }
-    if (!isEnabled) return;
+    if (isQueueProcessing || !isEnabled) return;
     const tasksToProcess = await store.get(KEY_QUEUE, []);
     if (tasksToProcess.length === 0) return;
     isQueueProcessing = true;
     log(`Acquired lock. Processing a batch of ${tasksToProcess.length} items.`);
     const succeededUrls = [], failedUrls = [];
     try {
-      for (const [i, item] of tasksToProcess.entries()) {
+      for (const item of tasksToProcess) {
         if (!item || typeof item.url !== 'string') continue;
         const success = await submitToWayback(item.url);
         if (success) {
@@ -98,15 +98,13 @@
     } finally {
         if (succeededUrls.length > 0) {
             const latestQueue = await store.get(KEY_QUEUE, []);
-            const finalQueue = latestQueue.filter(item => !item || typeof item.url !== 'string' ? false : !succeededUrls.includes(item.url));
+            const finalQueue = latestQueue.filter(item => !(item && item.url && succeededUrls.includes(item.url)));
             await store.set(KEY_QUEUE, finalQueue);
         }
         isQueueProcessing = false;
         log('Released lock. Batch processing complete.');
         if (tasksToProcess.length > 0) {
-            let summaryMsg = `Archive batch complete: ${succeededUrls.length} successful.`;
-            if (failedUrls.length > 0) summaryMsg += ` ${failedUrls.length} failed (will retry).`;
-            showToast(summaryMsg, 5000);
+            showToast(`Archive complete: ${succeededUrls.length} OK, ${failedUrls.length} failed.`, 5000);
         }
     }
   }
@@ -152,29 +150,37 @@
     if (!isEnabled) return;
     try {
       const canon = getCanonicalPostUrl(location.href);
-      if (!canon) return;
 
-      const allUrlsToArchive = new Set();
-
+      // On a rescan, we only care about finding new content, not the page state.
       if (isRescan) {
-          log('Rescanning page for new content after interaction...');
+          log('Rescanning page for new content...');
       } else {
-          // **FIX:** The primary cooldown check is now the first thing we do.
+          const lastCanon = await store.get(KEY_LAST_CANONICAL, null);
+          // **FIX:** If it's the same page as before, do nothing. This is the crucial SPA fix.
+          if (canon === lastCanon) return;
+          
+          await store.set(KEY_LAST_CANONICAL, canon); // Mark this page as "seen"
+
+          if (!canon) return; // Not a post page, nothing more to do.
+
           const lastTimestamp = await store.get('ts_' + canon, 0);
           if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
             log('Cool-down active for:', canon);
             return;
           }
           log('New post detected:', canon);
-          allUrlsToArchive.add(canon); // Only add the post itself on the first scan.
       }
 
       const postContainer = await waitForElement('div[data-testid="post-container"], div.thing');
       if (!postContainer) {
           log('Could not find post container.');
-          // If we couldn't find the container on a new post, at least archive the main URL.
-          if (!isRescan && allUrlsToArchive.size > 0) processArchiveQueue();
           return;
+      }
+      
+      const allUrlsToArchive = new Set();
+      // Only add the main post URL if it's the first scan of a new page.
+      if (!isRescan && canon) {
+          allUrlsToArchive.add(canon);
       }
 
       const contentUrls = extractUrlsFromContainer(postContainer);
@@ -225,7 +231,7 @@
     const id = 'history-hook-script', ev = 'wayback_history_changed';
     if (document.getElementById(id)) return;
     const s = document.createElement('script'); s.id = id;
-    s.textContent = `(()=>{if(window.top!==window.self)return;const d=()=>{try{window.dispatchEvent(new CustomEvent('${ev}'))}catch(e){console.error('[Wayback-archiver] Blocked cross-origin history event.')}},h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
+    s.textContent = `(()=>{if(window.top!==window.self)return;const d=()=>{try{window.dispatchEvent(new CustomEvent('${ev}'))}catch(e){}},h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
     (document.head || document.documentElement).appendChild(s);
   }
 
