@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback Auto-Archiver (v4.2 Final)
+// @name         Reddit → Wayback Auto-Archiver (v4.3 Final)
 // @namespace    reddit-wayback-autosave
-// @version      4.2.0
-// @description  A clean, stable, and robust script to auto-submit Reddit posts and their content. With intelligent URL construction for embeds.
+// @version      4.3.0
+// @description  A clean, stable, and robust script to auto-submit Reddit posts and their content. With a functional parser for embedded content.
 // @author       Branden Stober (refactored by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -149,23 +149,20 @@ class RedditArchiver {
             'div[data-media-container] a',
             'shreddit-player[src]',
             'iframe[src]',
-            'a.videoLink'
+            'shreddit-embed[html]'
         ].join(', ');
 
         container.querySelectorAll(selectors).forEach(el => {
-            const href = el.getAttribute('href');
-            let potentialUrl = el.src || href;
+            let potentialUrl = null;
 
-            if (el.tagName === 'A' && href && href.startsWith('/')) {
-                const innerMedia = el.querySelector('video[poster], img[src]');
-                if (innerMedia) {
-                    try {
-                        const sourceUrl = new URL(innerMedia.poster || innerMedia.src);
-                        const originHost = sourceUrl.hostname.split('.').slice(-2).join('.'); // Handles subdomains like media.redgifs.com
-                        potentialUrl = `https://${originHost}${href}`;
-                        this.log(`Constructed URL: ${potentialUrl}`);
-                    } catch (e) { /* Fallback to href */ }
+            if (el.tagName === 'SHREDDIT-EMBED' && el.hasAttribute('html')) {
+                const htmlString = el.getAttribute('html');
+                const srcMatch = htmlString.match(/src="([^"]+)"/);
+                if (srcMatch && srcMatch[1]) {
+                    potentialUrl = srcMatch[1].replace(/&/g, '&');
                 }
+            } else {
+                potentialUrl = el.getAttribute('src') || el.getAttribute('href');
             }
 
             if (potentialUrl && potentialUrl.startsWith('http')) {
