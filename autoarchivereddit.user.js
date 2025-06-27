@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback auto-archiver (Improved v2.3)
+// @name         Reddit → Wayback auto-archiver (Improved v2.4)
 // @namespace    reddit-wayback-autosave
-// @version      2.3.0
-// @description  A robust script to auto-submit Reddit posts and their content. Now handles sensitive content and fixes all cross-origin errors.
+// @version      2.4.0
+// @description  A robust script to auto-submit Reddit posts and their content. Fixes post detection regression.
 // @author       Branden Stober (fixed by AI, improved by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -31,7 +31,6 @@
   const HOUR       = 36e5;
   const KEY_GLOBAL = '_enabled';
   const KEY_QUEUE = '_archive_queue';
-  const KEY_LAST_URL = '_last_url';
   const store = {
     get: (k, d) => GM.getValue(k, d),
     set: (k, v) => GM.setValue(k, v)
@@ -119,7 +118,7 @@
           'div[data-test-id="post-content"] a', '.expando .md a',
           'div[data-media-container] a',
           'shreddit-player[src]',
-          'iframe[src]' // Crucial for post-click sensitive content
+          'iframe[src]'
       ].join(', ');
       container.querySelectorAll(selectors).forEach(el => {
           const url = el.getAttribute('src') || el.href;
@@ -153,43 +152,39 @@
     if (!isEnabled) return;
     try {
       const canon = getCanonicalPostUrl(location.href);
-      if (!canon) { await store.set(KEY_LAST_URL, ''); return; }
-      
-      // On a rescan, we skip cooldown and new post checks.
-      if (!isRescan) {
-          const lastCanonical = await store.get(KEY_LAST_URL, null);
-          if (canon === lastCanonical) return;
+      if (!canon) return;
+
+      const allUrlsToArchive = new Set();
+
+      if (isRescan) {
+          log('Rescanning page for new content after interaction...');
+      } else {
+          // **FIX:** The primary cooldown check is now the first thing we do.
           const lastTimestamp = await store.get('ts_' + canon, 0);
           if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
             log('Cool-down active for:', canon);
-            await store.set(KEY_LAST_URL, canon);
             return;
           }
-          await store.set(KEY_LAST_URL, canon);
           log('New post detected:', canon);
-      } else {
-          log('Rescanning page for new content after interaction...');
+          allUrlsToArchive.add(canon); // Only add the post itself on the first scan.
       }
 
       const postContainer = await waitForElement('div[data-testid="post-container"], div.thing');
       if (!postContainer) {
-          log('Could not find post container. Archiving post URL only.');
-          if (!isRescan) await addToArchiveQueue(canon);
+          log('Could not find post container.');
+          // If we couldn't find the container on a new post, at least archive the main URL.
+          if (!isRescan && allUrlsToArchive.size > 0) processArchiveQueue();
           return;
       }
 
-      // Add the main post URL only on the first scan.
-      const allUrlsToArchive = isRescan ? new Set() : new Set([canon]);
-      
       const contentUrls = extractUrlsFromContainer(postContainer);
       contentUrls.forEach(url => allUrlsToArchive.add(url));
-      
-      if (allUrlsToArchive.size > (isRescan ? 0 : 1)) {
-        log(`Found ${contentUrls.length} content URLs. Total to queue: ${allUrlsToArchive.size}`);
-      }
 
-      for (const url of allUrlsToArchive) { await addToArchiveQueue(url); }
-      if (allUrlsToArchive.size > 0) processArchiveQueue();
+      if (allUrlsToArchive.size > 0) {
+          log(`Found ${allUrlsToArchive.size} total URLs to queue.`);
+          for (const url of allUrlsToArchive) { await addToArchiveQueue(url); }
+          processArchiveQueue();
+      }
 
     } catch (err) {
       console.error('[Wayback-archiver] Error in handlePage:', err);
@@ -230,28 +225,23 @@
     const id = 'history-hook-script', ev = 'wayback_history_changed';
     if (document.getElementById(id)) return;
     const s = document.createElement('script'); s.id = id;
-    // **FIX 2**: The injected script now wraps dispatchEvent in a try-catch block.
-    // This catches permission errors from cross-origin iframes and prevents crashes.
     s.textContent = `(()=>{if(window.top!==window.self)return;const d=()=>{try{window.dispatchEvent(new CustomEvent('${ev}'))}catch(e){console.error('[Wayback-archiver] Blocked cross-origin history event.')}},h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
     (document.head || document.documentElement).appendChild(s);
   }
 
-  // **FIX 1**: Listen for clicks on sensitive content overlays.
   function setupInteractionListener() {
     document.body.addEventListener('click', (event) => {
-        // Selector for "View" / "Yes" buttons on NSFW/quarantined posts
         const revealButton = event.target.closest('.nsfw-see-more button, div[data-testid="post-content"] button');
         if (revealButton) {
             log('Sensitive content reveal clicked. Triggering a rescan in 2 seconds.');
-            // Wait a moment for the iframe to be inserted into the DOM.
             setTimeout(() => handlePage(true), 2000);
         }
-    }, true); // Use capture phase to catch the event early.
+    }, true);
   }
 
   function setupNavHooks() {
     injectNavigationListener();
-    setupInteractionListener(); // Set up the new click listener.
+    setupInteractionListener();
     const debouncedHandlePage = (() => { let t; return () => { clearTimeout(t); t = setTimeout(() => handlePage(false), 500); }; })();
     window.addEventListener('wayback_history_changed', debouncedHandlePage);
     debouncedHandlePage();
