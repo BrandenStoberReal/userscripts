@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Reddit → Wayback auto-archiver
+// @name         Reddit → Wayback auto-archiver (Improved)
 // @namespace    reddit-wayback-autosave
-// @version      1.7.5
-// @description  A robust script to auto-submit Reddit posts to the Wayback Machine. Fixes critical syntax error.
-// @author       Branden Stober (fixed by AI)
+// @version      2.0.0
+// @description  A robust script to auto-submit Reddit posts and their content to the Wayback Machine.
+// @author       Branden Stober (fixed by AI, improved by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @match        https://www.reddit.com/*
@@ -71,6 +71,8 @@
       queue.push({ url: url, addedAt: Date.now() });
       await store.set(KEY_QUEUE, queue);
       log('Added to archive queue:', url);
+      // IMPROVEMENT 1: Show a toast when an item is added to the queue for immediate feedback.
+      showToast('Added to archive queue.');
     }
   }
 
@@ -85,15 +87,15 @@
     log(`Acquired lock. Processing a batch of ${tasksToProcess.length} items.`);
 
     const succeededUrls = [];
+    const failedUrls = [];
 
     try {
-      // MODIFICATION: Changed to a `for...of` loop with `.entries()` to get the index.
       for (const [i, item] of tasksToProcess.entries()) {
         const logPrefix = `[${i + 1}/${tasksToProcess.length}]`;
 
         if (!item || typeof item.url !== 'string') {
             console.error('[Wayback-archiver]', logPrefix, 'Found and will remove a corrupted item.', item);
-            if (item && item.url) succeededUrls.push(item.url); // Use its own URL to remove if possible
+            if (item && item.url) succeededUrls.push(item.url);
             continue;
         }
 
@@ -105,6 +107,7 @@
             succeededUrls.push(item.url);
         } else {
             log(logPrefix, 'Archive failed, item will remain in queue for next run.', item.url);
+            failedUrls.push(item.url);
         }
       }
     } catch (err) {
@@ -114,15 +117,51 @@
             log(`Reconciling queue. ${succeededUrls.length} items to remove.`);
             const latestQueue = await store.get(KEY_QUEUE, []);
             const finalQueue = latestQueue.filter(item => {
-                if (!item || typeof item.url !== 'string') return false; // Remove corrupted
+                if (!item || typeof item.url !== 'string') return false;
                 return !succeededUrls.includes(item.url);
             });
             await store.set(KEY_QUEUE, finalQueue);
         }
         isQueueProcessing = false;
         log('Released lock. Batch processing complete.');
+
+        // IMPROVEMENT 1: Show a summary toast after the batch is finished.
+        if (tasksToProcess.length > 0) {
+            const successCount = succeededUrls.length;
+            const failureCount = failedUrls.length;
+            let summaryMsg = `Archive batch complete: ${successCount} successful.`;
+            if (failureCount > 0) {
+                summaryMsg += ` ${failureCount} failed (will retry).`;
+            }
+            showToast(summaryMsg, 5000);
+        }
     }
   }
+
+  // IMPROVEMENT 2: New function to extract content URLs from the post.
+  function extractContentUrls() {
+      const urls = new Set();
+      // Selectors for both old and new Reddit.
+      // Old Reddit: .media-preview for images/videos, .expando for self-text links, a.title for the main link.
+      // New Reddit: div[data-test-id="post-content"] for the main body, a[data-click-id="body"] for the main link.
+      const selectors = [
+          '.media-preview a',
+          '.expando .md a',
+          'a.title',
+          'div[data-test-id="post-content"] a',
+          'a[data-click-id="body"]',
+      ].join(', ');
+
+      document.querySelectorAll(selectors).forEach(a => {
+          // Ensure we have a valid, absolute URL and it's not another Reddit link.
+          if (a.href && a.href.startsWith('http') && !a.hostname.endsWith('reddit.com') && !a.hostname.endsWith('redd.it')) {
+              urls.add(a.href);
+          }
+      });
+      log(`Extracted ${urls.size} unique content URLs from the page.`);
+      return Array.from(urls);
+  }
+
 
   /* ---------- main work ---------- */
   async function handlePage() {
@@ -131,18 +170,38 @@
     try {
       const canon = getCanonicalPostUrl(currentUrl);
       if (!canon) { await store.set(KEY_LAST_URL, ''); return; }
+
       const lastCanonical = await store.get(KEY_LAST_URL, null);
       if (canon === lastCanonical) return;
+
       const lastTimestamp = await store.get('ts_' + canon, 0);
       if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
         log('Cool-down active for:', canon);
         await store.set(KEY_LAST_URL, canon);
         return;
       }
+
       await store.set(KEY_LAST_URL, canon);
       log('New post detected:', canon);
-      await addToArchiveQueue(canon);
+
+      // IMPROVEMENT 2: Queue the post's canonical URL AND its content URLs.
+      const allUrlsToArchive = new Set([canon]);
+      
+      // Wait for the page to be fully loaded to ensure content is available for scanning.
+      await new Promise(resolve => {
+        if (document.readyState === "complete") return resolve();
+        window.addEventListener('load', resolve, { once: true });
+      });
+
+      const contentUrls = extractContentUrls();
+      contentUrls.forEach(url => allUrlsToArchive.add(url));
+
+      for (const url of allUrlsToArchive) {
+          await addToArchiveQueue(url);
+      }
+      
       processArchiveQueue();
+
     } catch (err) {
       console.error('[Wayback-archiver] Error in handlePage:', err);
     }
@@ -158,7 +217,8 @@
           const success = r.status >= 200 && r.status < 400;
           if (r.status >= 500) console.error(`Wayback server error (${r.status})`, url);
           log('Wayback response', r.status, url);
-          showToast(success ? 'Successfully archived!' : 'Archive failed, will retry.');
+          // Note: Individual toasts are kept as they are useful for long-running single archives.
+          showToast(success ? `Archived: ${new URL(url).hostname}` : 'Archive failed, will retry.');
           res(success);
         },
         onerror: e => { console.error('Wayback XHR error', e); showToast('Error connecting. Will retry.'); res(false); },
@@ -167,9 +227,7 @@
     });
   }
 
-  // =================================================================
-  // ========== FIXED CANONICAL URL FUNCTION =========================
-  // =================================================================
+  /* ---------- URL & Nav Helpers ---------- */
   function getCanonicalPostUrl(href) {
     try {
       const url = new URL(href);
@@ -177,21 +235,17 @@
         const p = url.pathname.replace(/^\/|\/$/g, '');
         return p ? `https://old.reddit.com/comments/${p}` : null;
       }
-      // **THE CRITICAL FIX IS HERE**: [a-z0-9] is the correct syntax.
       const m = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
       return (m && m[1]) ? `https://old.reddit.com/comments/${m[1]}` : null;
     } catch (e) { return null; }
   }
 
-  /* ---------- ROBUST NAVIGATION HOOK VIA SCRIPT INJECTION ---------- */
   function injectNavigationListener() {
     const id = 'history-hook-script', ev = 'wayback_history_changed';
     if (document.getElementById(id)) return;
     const s = document.createElement('script'); s.id = id;
     s.textContent = `(()=>{const d=()=>window.dispatchEvent(new CustomEvent('${ev}')),h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
     (document.head || document.documentElement).appendChild(s);
-    // **RELIABILITY FIX**: Do not remove the script tag immediately.
-    // Let it persist to guarantee it has time to execute.
   }
 
   function setupNavHooks() {
