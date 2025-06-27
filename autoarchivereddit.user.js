@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback auto-archiver (Improved v2)
+// @name         Reddit → Wayback auto-archiver (Improved v2.1)
 // @namespace    reddit-wayback-autosave
-// @version      2.1.0
-// @description  A robust script to auto-submit Reddit posts and their content to the Wayback Machine. Now with improved content detection.
+// @version      2.1.1
+// @description  A robust script to auto-submit Reddit posts and their content to the Wayback Machine. Fixes cross-origin errors.
 // @author       Branden Stober (fixed by AI, improved by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -120,38 +120,32 @@
     }
   }
 
-  // IMPROVEMENT 2: More robust selectors to find content links.
   function extractUrlsFromPage() {
       const urls = new Set();
       const selectors = [
-          // New Reddit: Main link for a link-post. Very reliable.
           'a[data-click-id="body"]',
-          // New Reddit: Image source for a direct image post.
           'img[alt="Post image"]',
-          // New Reddit: Links inside the content area (good for embeds and self-posts).
           'div[data-test-id="post-content"] a',
-          // Old Reddit: Main link for a link-post.
           'a.title',
-          // Old Reddit: Links inside the media preview or self-text.
           '.media-preview a',
           '.expando .md a',
       ].join(', ');
 
       document.querySelectorAll(selectors).forEach(el => {
-          const url = el.tagName === 'IMG' ? el.src : el.href;
-          if (url && url.startsWith('http') && !/reddit\.com|redd\.it/.test(new URL(url).hostname)) {
-              urls.add(url);
-          }
+          try {
+            const url = el.tagName === 'IMG' ? el.src : el.href;
+            if (url && url.startsWith('http') && !/reddit\.com|redd\.it/.test(new URL(url).hostname)) {
+                urls.add(url);
+            }
+          } catch (e) { /* Ignore invalid URLs */ }
       });
       return Array.from(urls);
   }
 
-  // IMPROVEMENT 1: Poll for content to handle dynamic loading (e.g., Redgifs).
   function pollForContentUrls(timeout = 10000, interval = 500) {
     return new Promise(resolve => {
         let attempts = 0;
         const maxAttempts = timeout / interval;
-
         const poller = setInterval(() => {
             const urls = extractUrlsFromPage();
             if (urls.length > 0) {
@@ -184,21 +178,14 @@
       }
       await store.set(KEY_LAST_URL, canon);
       log('New post detected:', canon);
-
       const allUrlsToArchive = new Set([canon]);
-      
-      // Use the new polling mechanism to find content.
       const contentUrls = await pollForContentUrls();
       contentUrls.forEach(url => allUrlsToArchive.add(url));
-      
       log(`Total URLs to queue: ${allUrlsToArchive.size}`, Array.from(allUrlsToArchive));
-
       for (const url of allUrlsToArchive) {
           await addToArchiveQueue(url);
       }
-      
       processArchiveQueue();
-
     } catch (err) {
       console.error('[Wayback-archiver] Error in handlePage:', err);
     }
@@ -244,7 +231,9 @@
     const id = 'history-hook-script', ev = 'wayback_history_changed';
     if (document.getElementById(id)) return;
     const s = document.createElement('script'); s.id = id;
-    s.textContent = `(()=>{const d=()=>window.dispatchEvent(new CustomEvent('${ev}')),h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
+    // **THE FIX IS HERE**: The injected script now checks if it's in the top window.
+    // If not (i.e., it's in an iframe), it does nothing.
+    s.textContent = `(()=>{if(window.top!==window.self)return;const d=()=>window.dispatchEvent(new CustomEvent('${ev}')),h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
     (document.head || document.documentElement).appendChild(s);
   }
 
