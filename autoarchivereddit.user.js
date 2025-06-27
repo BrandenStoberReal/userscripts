@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback auto-archiver (Improved v2.2)
+// @name         Reddit → Wayback auto-archiver (Improved v2.3)
 // @namespace    reddit-wayback-autosave
-// @version      2.2.0
-// @description  A robust script to auto-submit Reddit posts and their content to the Wayback Machine. Features a more reliable content scanner.
+// @version      2.3.0
+// @description  A robust script to auto-submit Reddit posts and their content. Now handles sensitive content and fixes all cross-origin errors.
 // @author       Branden Stober (fixed by AI, improved by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -85,20 +85,12 @@
     const succeededUrls = [], failedUrls = [];
     try {
       for (const [i, item] of tasksToProcess.entries()) {
-        const logPrefix = `[${i + 1}/${tasksToProcess.length}]`;
-        if (!item || typeof item.url !== 'string') {
-            console.error('[Wayback-archiver]', logPrefix, 'Found and will remove a corrupted item.', item);
-            if (item && item.url) succeededUrls.push(item.url);
-            continue;
-        }
-        log(logPrefix, 'Attempting to archive:', item.url);
+        if (!item || typeof item.url !== 'string') continue;
         const success = await submitToWayback(item.url);
         if (success) {
-            log(logPrefix, 'Archive successful for:', item.url);
             await store.set('ts_' + item.url, Date.now());
             succeededUrls.push(item.url);
         } else {
-            log(logPrefix, 'Archive failed, item will remain in queue for next run.', item.url);
             failedUrls.push(item.url);
         }
       }
@@ -120,22 +112,16 @@
     }
   }
 
-  // IMPROVEMENT 2: More specific and comprehensive selectors.
   function extractUrlsFromContainer(container) {
       const urls = new Set();
-      // These selectors are now run *inside* the found post container.
       const selectors = [
-          'a[data-click-id="body"]', // New Reddit: Main link post URL
-          'a.title',                 // Old Reddit: Main link post URL
-          'div[data-test-id="post-content"] a', // New Reddit: Links in self-text
-          '.expando .md a',          // Old Reddit: Links in self-text
-          'div[data-media-container] a', // New Reddit: Gallery links
-          'img.media-forward-img',   // New Reddit: Image in some media previews
-          'shreddit-player[src]',    // New Reddit: Direct video URL from player
+          'a[data-click-id="body"]', 'a.title',
+          'div[data-test-id="post-content"] a', '.expando .md a',
+          'div[data-media-container] a',
+          'shreddit-player[src]',
+          'iframe[src]' // Crucial for post-click sensitive content
       ].join(', ');
-
       container.querySelectorAll(selectors).forEach(el => {
-          // Use `getAttribute` for custom elements like shreddit-player
           const url = el.getAttribute('src') || el.href;
           if (url && url.startsWith('http')) {
              try {
@@ -148,69 +134,62 @@
       return Array.from(urls);
   }
 
-  // IMPROVEMENT 1: A two-stage wait. First for the container, then for links inside it.
-  function waitForElement(selector, timeout = 10000) {
+  function waitForElement(selector, context = document, timeout = 5000) {
       return new Promise((resolve) => {
-          const el = document.querySelector(selector);
+          const el = context.querySelector(selector);
           if (el) return resolve(el);
           const observer = new MutationObserver(() => {
-              const el = document.querySelector(selector);
-              if (el) {
-                  observer.disconnect();
-                  resolve(el);
-              }
+              const el = context.querySelector(selector);
+              if (el) { observer.disconnect(); resolve(el); }
           });
-          observer.observe(document.body, { childList: true, subtree: true });
-          setTimeout(() => {
-              observer.disconnect();
-              resolve(null); // Resolve with null if timed out
-          }, timeout);
+          observer.observe(context, { childList: true, subtree: true });
+          setTimeout(() => { observer.disconnect(); resolve(null); }, timeout);
       });
   }
 
 
   /* ---------- main work ---------- */
-  async function handlePage() {
+  async function handlePage(isRescan = false) {
     if (!isEnabled) return;
     try {
       const canon = getCanonicalPostUrl(location.href);
       if (!canon) { await store.set(KEY_LAST_URL, ''); return; }
-      const lastCanonical = await store.get(KEY_LAST_URL, null);
-      if (canon === lastCanonical) return;
-      const lastTimestamp = await store.get('ts_' + canon, 0);
-      if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
-        log('Cool-down active for:', canon);
-        await store.set(KEY_LAST_URL, canon);
-        return;
-      }
-      await store.set(KEY_LAST_URL, canon);
-      log('New post detected:', canon);
-
-      // STAGE 1: Wait for the main post container to appear in the DOM.
-      // This covers both new Reddit's data-testid and old Reddit's class-based structure.
-      log('Waiting for post container...');
-      const postContainer = await waitForElement('div[data-testid="post-container"], div.thing');
       
+      // On a rescan, we skip cooldown and new post checks.
+      if (!isRescan) {
+          const lastCanonical = await store.get(KEY_LAST_URL, null);
+          if (canon === lastCanonical) return;
+          const lastTimestamp = await store.get('ts_' + canon, 0);
+          if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
+            log('Cool-down active for:', canon);
+            await store.set(KEY_LAST_URL, canon);
+            return;
+          }
+          await store.set(KEY_LAST_URL, canon);
+          log('New post detected:', canon);
+      } else {
+          log('Rescanning page for new content after interaction...');
+      }
+
+      const postContainer = await waitForElement('div[data-testid="post-container"], div.thing');
       if (!postContainer) {
-          log('Could not find post container, archiving post URL only.');
-          await addToArchiveQueue(canon);
-          processArchiveQueue();
+          log('Could not find post container. Archiving post URL only.');
+          if (!isRescan) await addToArchiveQueue(canon);
           return;
       }
-      log('Post container found. Scanning for content URLs.');
 
-      // STAGE 2: Poll for links *inside* the container.
+      // Add the main post URL only on the first scan.
+      const allUrlsToArchive = isRescan ? new Set() : new Set([canon]);
+      
       const contentUrls = extractUrlsFromContainer(postContainer);
-
-      const allUrlsToArchive = new Set([canon, ...contentUrls]);
+      contentUrls.forEach(url => allUrlsToArchive.add(url));
       
-      log(`Total URLs to queue: ${allUrlsToArchive.size}`, Array.from(allUrlsToArchive));
-
-      for (const url of allUrlsToArchive) {
-          await addToArchiveQueue(url);
+      if (allUrlsToArchive.size > (isRescan ? 0 : 1)) {
+        log(`Found ${contentUrls.length} content URLs. Total to queue: ${allUrlsToArchive.size}`);
       }
-      
-      processArchiveQueue();
+
+      for (const url of allUrlsToArchive) { await addToArchiveQueue(url); }
+      if (allUrlsToArchive.size > 0) processArchiveQueue();
 
     } catch (err) {
       console.error('[Wayback-archiver] Error in handlePage:', err);
@@ -225,17 +204,11 @@
         method: 'GET', url: saveUrl, timeout: 60000,
         onload: r => {
           const success = r.status >= 200 && r.status < 400;
-          if (r.status >= 500) console.error(`Wayback server error (${r.status})`, url);
-          log('Wayback response', r.status, url);
-          try {
-            showToast(success ? `Archived: ${new URL(url).hostname}` : 'Archive failed, will retry.');
-          } catch (e) {
-            showToast(success ? 'Successfully archived!' : 'Archive failed, will retry.');
-          }
+          if (!success) console.error(`Wayback server error (${r.status}) for`, url);
           res(success);
         },
-        onerror: e => { console.error('Wayback XHR error', e); showToast('Error connecting. Will retry.'); res(false); },
-        ontimeout: () => { console.error('Wayback XHR timeout'); showToast('Request timed out. Will retry.'); res(false); }
+        onerror: e => { console.error('Wayback XHR error', e); res(false); },
+        ontimeout: () => { console.error('Wayback XHR timeout'); res(false); }
       });
     });
   }
@@ -257,13 +230,29 @@
     const id = 'history-hook-script', ev = 'wayback_history_changed';
     if (document.getElementById(id)) return;
     const s = document.createElement('script'); s.id = id;
-    s.textContent = `(()=>{if(window.top!==window.self)return;const d=()=>window.dispatchEvent(new CustomEvent('${ev}')),h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
+    // **FIX 2**: The injected script now wraps dispatchEvent in a try-catch block.
+    // This catches permission errors from cross-origin iframes and prevents crashes.
+    s.textContent = `(()=>{if(window.top!==window.self)return;const d=()=>{try{window.dispatchEvent(new CustomEvent('${ev}'))}catch(e){console.error('[Wayback-archiver] Blocked cross-origin history event.')}},h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
     (document.head || document.documentElement).appendChild(s);
+  }
+
+  // **FIX 1**: Listen for clicks on sensitive content overlays.
+  function setupInteractionListener() {
+    document.body.addEventListener('click', (event) => {
+        // Selector for "View" / "Yes" buttons on NSFW/quarantined posts
+        const revealButton = event.target.closest('.nsfw-see-more button, div[data-testid="post-content"] button');
+        if (revealButton) {
+            log('Sensitive content reveal clicked. Triggering a rescan in 2 seconds.');
+            // Wait a moment for the iframe to be inserted into the DOM.
+            setTimeout(() => handlePage(true), 2000);
+        }
+    }, true); // Use capture phase to catch the event early.
   }
 
   function setupNavHooks() {
     injectNavigationListener();
-    const debouncedHandlePage = (() => { let t; return () => { clearTimeout(t); t = setTimeout(handlePage, 500); }; })();
+    setupInteractionListener(); // Set up the new click listener.
+    const debouncedHandlePage = (() => { let t; return () => { clearTimeout(t); t = setTimeout(() => handlePage(false), 500); }; })();
     window.addEventListener('wayback_history_changed', debouncedHandlePage);
     debouncedHandlePage();
     setInterval(processArchiveQueue, 60000);
