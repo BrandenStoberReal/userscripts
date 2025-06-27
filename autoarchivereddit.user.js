@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback auto-archiver (Improved)
+// @name         Reddit → Wayback auto-archiver (Improved v2)
 // @namespace    reddit-wayback-autosave
-// @version      2.0.0
-// @description  A robust script to auto-submit Reddit posts and their content to the Wayback Machine.
+// @version      2.1.0
+// @description  A robust script to auto-submit Reddit posts and their content to the Wayback Machine. Now with improved content detection.
 // @author       Branden Stober (fixed by AI, improved by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -71,34 +71,26 @@
       queue.push({ url: url, addedAt: Date.now() });
       await store.set(KEY_QUEUE, queue);
       log('Added to archive queue:', url);
-      // IMPROVEMENT 1: Show a toast when an item is added to the queue for immediate feedback.
       showToast('Added to archive queue.');
     }
   }
 
   async function processArchiveQueue() {
-    if (isQueueProcessing) { log('Queue is already being processed. Skipping.'); return; }
+    if (isQueueProcessing) { return; }
     if (!isEnabled) return;
-
     const tasksToProcess = await store.get(KEY_QUEUE, []);
     if (tasksToProcess.length === 0) return;
-
     isQueueProcessing = true;
     log(`Acquired lock. Processing a batch of ${tasksToProcess.length} items.`);
-
-    const succeededUrls = [];
-    const failedUrls = [];
-
+    const succeededUrls = [], failedUrls = [];
     try {
       for (const [i, item] of tasksToProcess.entries()) {
         const logPrefix = `[${i + 1}/${tasksToProcess.length}]`;
-
         if (!item || typeof item.url !== 'string') {
             console.error('[Wayback-archiver]', logPrefix, 'Found and will remove a corrupted item.', item);
             if (item && item.url) succeededUrls.push(item.url);
             continue;
         }
-
         log(logPrefix, 'Attempting to archive:', item.url);
         const success = await submitToWayback(item.url);
         if (success) {
@@ -114,87 +106,92 @@
         console.error('[Wayback-archiver] A critical error occurred during batch processing.', err);
     } finally {
         if (succeededUrls.length > 0) {
-            log(`Reconciling queue. ${succeededUrls.length} items to remove.`);
             const latestQueue = await store.get(KEY_QUEUE, []);
-            const finalQueue = latestQueue.filter(item => {
-                if (!item || typeof item.url !== 'string') return false;
-                return !succeededUrls.includes(item.url);
-            });
+            const finalQueue = latestQueue.filter(item => !item || typeof item.url !== 'string' ? false : !succeededUrls.includes(item.url));
             await store.set(KEY_QUEUE, finalQueue);
         }
         isQueueProcessing = false;
         log('Released lock. Batch processing complete.');
-
-        // IMPROVEMENT 1: Show a summary toast after the batch is finished.
         if (tasksToProcess.length > 0) {
-            const successCount = succeededUrls.length;
-            const failureCount = failedUrls.length;
-            let summaryMsg = `Archive batch complete: ${successCount} successful.`;
-            if (failureCount > 0) {
-                summaryMsg += ` ${failureCount} failed (will retry).`;
-            }
+            let summaryMsg = `Archive batch complete: ${succeededUrls.length} successful.`;
+            if (failedUrls.length > 0) summaryMsg += ` ${failedUrls.length} failed (will retry).`;
             showToast(summaryMsg, 5000);
         }
     }
   }
 
-  // IMPROVEMENT 2: New function to extract content URLs from the post.
-  function extractContentUrls() {
+  // IMPROVEMENT 2: More robust selectors to find content links.
+  function extractUrlsFromPage() {
       const urls = new Set();
-      // Selectors for both old and new Reddit.
-      // Old Reddit: .media-preview for images/videos, .expando for self-text links, a.title for the main link.
-      // New Reddit: div[data-test-id="post-content"] for the main body, a[data-click-id="body"] for the main link.
       const selectors = [
+          // New Reddit: Main link for a link-post. Very reliable.
+          'a[data-click-id="body"]',
+          // New Reddit: Image source for a direct image post.
+          'img[alt="Post image"]',
+          // New Reddit: Links inside the content area (good for embeds and self-posts).
+          'div[data-test-id="post-content"] a',
+          // Old Reddit: Main link for a link-post.
+          'a.title',
+          // Old Reddit: Links inside the media preview or self-text.
           '.media-preview a',
           '.expando .md a',
-          'a.title',
-          'div[data-test-id="post-content"] a',
-          'a[data-click-id="body"]',
       ].join(', ');
 
-      document.querySelectorAll(selectors).forEach(a => {
-          // Ensure we have a valid, absolute URL and it's not another Reddit link.
-          if (a.href && a.href.startsWith('http') && !a.hostname.endsWith('reddit.com') && !a.hostname.endsWith('redd.it')) {
-              urls.add(a.href);
+      document.querySelectorAll(selectors).forEach(el => {
+          const url = el.tagName === 'IMG' ? el.src : el.href;
+          if (url && url.startsWith('http') && !/reddit\.com|redd\.it/.test(new URL(url).hostname)) {
+              urls.add(url);
           }
       });
-      log(`Extracted ${urls.size} unique content URLs from the page.`);
       return Array.from(urls);
   }
 
+  // IMPROVEMENT 1: Poll for content to handle dynamic loading (e.g., Redgifs).
+  function pollForContentUrls(timeout = 10000, interval = 500) {
+    return new Promise(resolve => {
+        let attempts = 0;
+        const maxAttempts = timeout / interval;
+
+        const poller = setInterval(() => {
+            const urls = extractUrlsFromPage();
+            if (urls.length > 0) {
+                log(`Found content URLs after ${attempts * interval}ms.`);
+                clearInterval(poller);
+                resolve(urls);
+            } else if (attempts >= maxAttempts) {
+                log('Polling timed out. No unique content URLs found.');
+                clearInterval(poller);
+                resolve([]);
+            }
+            attempts++;
+        }, interval);
+    });
+  }
 
   /* ---------- main work ---------- */
   async function handlePage() {
     if (!isEnabled) return;
-    const currentUrl = location.href;
     try {
-      const canon = getCanonicalPostUrl(currentUrl);
+      const canon = getCanonicalPostUrl(location.href);
       if (!canon) { await store.set(KEY_LAST_URL, ''); return; }
-
       const lastCanonical = await store.get(KEY_LAST_URL, null);
       if (canon === lastCanonical) return;
-
       const lastTimestamp = await store.get('ts_' + canon, 0);
       if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
         log('Cool-down active for:', canon);
         await store.set(KEY_LAST_URL, canon);
         return;
       }
-
       await store.set(KEY_LAST_URL, canon);
       log('New post detected:', canon);
 
-      // IMPROVEMENT 2: Queue the post's canonical URL AND its content URLs.
       const allUrlsToArchive = new Set([canon]);
       
-      // Wait for the page to be fully loaded to ensure content is available for scanning.
-      await new Promise(resolve => {
-        if (document.readyState === "complete") return resolve();
-        window.addEventListener('load', resolve, { once: true });
-      });
-
-      const contentUrls = extractContentUrls();
+      // Use the new polling mechanism to find content.
+      const contentUrls = await pollForContentUrls();
       contentUrls.forEach(url => allUrlsToArchive.add(url));
+      
+      log(`Total URLs to queue: ${allUrlsToArchive.size}`, Array.from(allUrlsToArchive));
 
       for (const url of allUrlsToArchive) {
           await addToArchiveQueue(url);
@@ -217,8 +214,11 @@
           const success = r.status >= 200 && r.status < 400;
           if (r.status >= 500) console.error(`Wayback server error (${r.status})`, url);
           log('Wayback response', r.status, url);
-          // Note: Individual toasts are kept as they are useful for long-running single archives.
-          showToast(success ? `Archived: ${new URL(url).hostname}` : 'Archive failed, will retry.');
+          try {
+            showToast(success ? `Archived: ${new URL(url).hostname}` : 'Archive failed, will retry.');
+          } catch (e) {
+            showToast(success ? 'Successfully archived!' : 'Archive failed, will retry.');
+          }
           res(success);
         },
         onerror: e => { console.error('Wayback XHR error', e); showToast('Error connecting. Will retry.'); res(false); },
