@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Reddit → Wayback auto-archiver (v3.0 Stable)
+// @name         Reddit → Wayback Auto-Archiver (v4.0 Refactored)
 // @namespace    reddit-wayback-autosave
-// @version      3.0.0
-// @description  A robust script to auto-submit Reddit posts and their content. Reverted to stable, original navigation logic.
-// @author       Branden Stober (fixed by AI, improved by AI)
+// @version      4.0.0
+// @description  A clean, stable, and robust script to auto-submit Reddit posts and their content to the Wayback Machine.
+// @author       Branden Stober (refactored by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @match        https://www.reddit.com/*
@@ -20,241 +20,295 @@
 // @run-at       document-start
 // ==/UserScript==
 
-(() => {
-  /* ========== USER SETTINGS ========== */
-  const COOLDOWN_HOURS  = 24;
-  const ENABLED_DEFAULT = true;
-  const DEBUG_LOGGING   = true;
-  /* =================================== */
-
-  /* ---------- tiny helpers ---------- */
-  const HOUR       = 36e5;
-  const KEY_GLOBAL = '_enabled';
-  const KEY_QUEUE = '_archive_queue';
-  const KEY_LAST_URL = '_last_url'; // Using the original key for simplicity
-  const store = {
-    get: (k, d) => GM.getValue(k, d),
-    set: (k, v) => GM.setValue(k, v)
-  };
-  const log = (...a) => DEBUG_LOGGING && console.log('[Wayback-archiver]', ...a);
-
-  /* ---------- little toast ---------- */
-  GM.addStyle(`
-   .wb-toast{position:fixed;bottom:20px;right:20px;max-width:260px;padding:8px 12px;
-    font:13px/17px system-ui,sans-serif;color:#fff;background:#323232e6;border-radius:4px;
-    box-shadow:0 2px 4px rgba(0,0,0,.35);opacity:0;transform:translateY(10px);
-    transition:opacity .25s,transform .25s;z-index:2147483647;pointer-events:none}
-   .wb-toast.show{opacity:1;transform:translateY(0)}
-  `);
-
-  function showToast(msg, ms = 3500) {
-    if (!document.body) { window.addEventListener('DOMContentLoaded', () => showToast(msg, ms)); return; }
-    const el = document.createElement('div');
-    el.className = 'wb-toast';
-    el.textContent = msg;
-    document.body.appendChild(el);
-    setTimeout(() => el.classList.add('show'), 10);
-    setTimeout(() => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); }, ms);
-  }
-
-  /* ---------- enable / disable ---------- */
-  let isEnabled = ENABLED_DEFAULT;
-  store.get(KEY_GLOBAL, ENABLED_DEFAULT).then(val => { isEnabled = !!val; log(`Script status loaded. Enabled: ${isEnabled}`); });
-  GM.registerMenuCommand('Toggle auto-archiving', async () => { isEnabled = !isEnabled; await store.set(KEY_GLOBAL, isEnabled); alert(`Reddit → Wayback auto-archiver is now ${isEnabled ? 'ENABLED' : 'DISABLED'}.`); });
-
-  /* ---------- Archive Queue System ---------- */
-  let isQueueProcessing = false;
-
-  async function addToArchiveQueue(url) {
-    const queue = await store.get(KEY_QUEUE, []);
-    if (!queue.some(item => item && item.url === url)) {
-      queue.push({ url: url, addedAt: Date.now() });
-      await store.set(KEY_QUEUE, queue);
-      log('Added to archive queue:', url);
-      showToast('Added to archive queue.');
+class RedditArchiver {
+    constructor() {
+        this.settings = {
+            COOLDOWN_HOURS: 24,
+            ENABLED_DEFAULT: true,
+            DEBUG_LOGGING: true,
+        };
+        this.keys = {
+            GLOBAL_ENABLED: '_enabled',
+            ARCHIVE_QUEUE: '_archive_queue',
+            LAST_PROCESSED_URL: '_last_processed_url',
+        };
+        this.state = {
+            isEnabled: this.settings.ENABLED_DEFAULT,
+            isQueueProcessing: false,
+            lastProcessedUrl: null,
+        };
+        this.init();
     }
-  }
 
-  async function processArchiveQueue() {
-    if (isQueueProcessing || !isEnabled) return;
-    const tasksToProcess = await store.get(KEY_QUEUE, []);
-    if (tasksToProcess.length === 0) return;
-    isQueueProcessing = true;
-    log(`Acquired lock. Processing a batch of ${tasksToProcess.length} items.`);
-    const succeededUrls = [], failedUrls = [];
-    try {
-      for (const item of tasksToProcess) {
-        if (!item || typeof item.url !== 'string') continue;
-        const success = await submitToWayback(item.url);
-        if (success) {
-            await store.set('ts_' + item.url, Date.now());
-            succeededUrls.push(item.url);
-        } else {
-            failedUrls.push(item.url);
-        }
-      }
-    } catch (err) {
-        console.error('[Wayback-archiver] A critical error occurred during batch processing.', err);
-    } finally {
-        if (succeededUrls.length > 0) {
-            const latestQueue = await store.get(KEY_QUEUE, []);
-            const finalQueue = latestQueue.filter(item => !(item && item.url && succeededUrls.includes(item.url)));
-            await store.set(KEY_QUEUE, finalQueue);
-        }
-        isQueueProcessing = false;
-        log('Released lock. Batch processing complete.');
-        if (tasksToProcess.length > 0) {
-            showToast(`Archive complete: ${succeededUrls.length} OK, ${failedUrls.length} failed.`, 5000);
+    log(...args) {
+        if (this.settings.DEBUG_LOGGING) {
+            console.log('[Wayback-archiver]', ...args);
         }
     }
-  }
 
-  function extractUrlsFromContainer(container) {
-      const urls = new Set();
-      const selectors = [
-          'a[data-click-id="body"]', 'a.title',
-          'div[data-test-id="post-content"] a', '.expando .md a',
-          'div[data-media-container] a',
-          'shreddit-player[src]',
-          'iframe[src]'
-      ].join(', ');
-      container.querySelectorAll(selectors).forEach(el => {
-          const url = el.getAttribute('src') || el.href;
-          if (url && url.startsWith('http')) {
-             try {
-                 if (!/reddit\.com|redd\.it/.test(new URL(url).hostname)) {
-                     urls.add(url);
-                 }
-             } catch(e) {/* Ignore invalid URLs */}
-          }
-      });
-      return Array.from(urls);
-  }
-
-  function waitForElement(selector, context = document, timeout = 5000) {
-      return new Promise((resolve) => {
-          const el = context.querySelector(selector);
-          if (el) return resolve(el);
-          const observer = new MutationObserver(() => {
-              const el = context.querySelector(selector);
-              if (el) { observer.disconnect(); resolve(el); }
-          });
-          observer.observe(context, { childList: true, subtree: true });
-          setTimeout(() => { observer.disconnect(); resolve(null); }, timeout);
-      });
-  }
-
-  /* ---------- main work ---------- */
-  async function handlePage() {
-    if (!isEnabled) return;
-    try {
-      const canon = getCanonicalPostUrl(location.href);
-      
-      // If we are not on a post page, reset the last URL. This allows navigating
-      // from a non-post page (like the homepage) to a post to work correctly.
-      if (!canon) {
-          await store.set(KEY_LAST_URL, '');
-          return;
-      }
-      
-      const lastCanonical = await store.get(KEY_LAST_URL, null);
-      // **REVERTED LOGIC:** This is the original, simple check. If we've already handled this page, stop.
-      if (canon === lastCanonical) {
-          return;
-      }
-      
-      const lastTimestamp = await store.get('ts_' + canon, 0);
-      if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
-          log('Cool-down active for:', canon);
-          await store.set(KEY_LAST_URL, canon); // Mark as seen even if on cooldown to prevent re-triggering.
-          return;
-      }
-      
-      log('New post detected:', canon);
-      await store.set(KEY_LAST_URL, canon); // Mark this page as handled.
-
-      const allUrlsToArchive = new Set([canon]);
-      const postContainer = await waitForElement('div[data-testid="post-container"], div.thing');
-      if (postContainer) {
-          const contentUrls = extractUrlsFromContainer(postContainer);
-          contentUrls.forEach(url => allUrlsToArchive.add(url));
-      }
-
-      log(`Found ${allUrlsToArchive.size} total URLs to queue.`);
-      for (const url of allUrlsToArchive) { await addToArchiveQueue(url); }
-      processArchiveQueue();
-
-    } catch (err) {
-      console.error('[Wayback-archiver] Error in handlePage:', err);
+    async init() {
+        this.injectStyles();
+        this.injectNavigationListener();
+        await this.loadState();
+        this.setupEventListeners();
+        this.log('Userscript initialized and ready.');
     }
-  }
 
-  /* ---------- Wayback submit ---------- */
-  function submitToWayback(url) {
-    const saveUrl = 'https://web.archive.org/save/' + encodeURIComponent(url);
-    return new Promise(res => {
-      GM.xmlHttpRequest({
-        method: 'GET', url: saveUrl, timeout: 60000,
-        onload: r => {
-          const success = r.status >= 200 && r.status < 400;
-          if (!success) console.error(`Wayback server error (${r.status}) for`, url);
-          res(success);
-        },
-        onerror: e => { console.error('Wayback XHR error', e); res(false); },
-        ontimeout: () => { console.error('Wayback XHR timeout'); res(false); }
-      });
-    });
-  }
+    async loadState() {
+        this.state.isEnabled = await GM.getValue(this.keys.GLOBAL_ENABLED, this.settings.ENABLED_DEFAULT);
+        this.state.lastProcessedUrl = await GM.getValue(this.keys.LAST_PROCESSED_URL, null);
+        this.log(`State loaded. Enabled: ${this.state.isEnabled}`);
+    }
 
-  /* ---------- URL & Nav Helpers ---------- */
-  function getCanonicalPostUrl(href) {
-    try {
-      const url = new URL(href);
-      if (url.hostname === 'redd.it') {
-        const p = url.pathname.replace(/^\/|\/$/g, '');
-        return p ? `https://old.reddit.com/comments/${p}` : null;
-      }
-      const m = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
-      return (m && m[1]) ? `https://old.reddit.com/comments/${m[1]}` : null;
-    } catch (e) { return null; }
-  }
+    getCanonicalPostUrl(href) {
+        try {
+            const url = new URL(href);
+            if (url.hostname === 'redd.it') {
+                const p = url.pathname.replace(/^\/|\/$/g, '');
+                return p ? `https://old.reddit.com/comments/${p}` : null;
+            }
+            const match = url.pathname.match(/\/(?:comments|gallery)\/([a-z0-9]+)/i);
+            return (match && match[1]) ? `https://old.reddit.com/comments/${match[1]}` : null;
+        } catch (e) {
+            return null;
+        }
+    }
 
-  function injectNavigationListener() {
-    const id = 'history-hook-script', ev = 'wayback_history_changed';
-    if (document.getElementById(id)) return;
-    const s = document.createElement('script'); s.id = id;
-    s.textContent = `(()=>{if(window.top!==window.self)return;const d=()=>{try{window.dispatchEvent(new CustomEvent('${ev}'))}catch(e){}},h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
-    (document.head || document.documentElement).appendChild(s);
-  }
+    async handlePageChange() {
+        if (!this.state.isEnabled) return;
 
-  async function handleInteraction(event) {
-    if (!isEnabled) return;
-    const revealButton = event.target.closest('.nsfw-see-more button, div[data-testid="post-content"] button, button[data-testid="nsfw-button-ok"]');
-    if (revealButton) {
-        log('Sensitive content reveal clicked. Waiting for iframe...');
-        const postContainer = revealButton.closest('div[data-testid="post-container"], div.thing');
-        if (!postContainer) return;
+        try {
+            const canonicalUrl = this.getCanonicalPostUrl(location.href);
+
+            if (!canonicalUrl) {
+                await GM.setValue(this.keys.LAST_PROCESSED_URL, '');
+                return;
+            }
+
+            if (canonicalUrl === this.state.lastProcessedUrl) {
+                return;
+            }
+
+            this.state.lastProcessedUrl = canonicalUrl;
+            await GM.setValue(this.keys.LAST_PROCESSED_URL, canonicalUrl);
+
+            const lastTimestamp = await GM.getValue('ts_' + canonicalUrl, 0);
+            const cooldownMs = this.settings.COOLDOWN_HOURS * 36e5;
+            if (Date.now() - lastTimestamp < cooldownMs) {
+                this.log('Cool-down active for:', canonicalUrl);
+                return;
+            }
+
+            this.log('New post detected:', canonicalUrl);
+            const urlsToArchive = new Set([canonicalUrl]);
+            const postContainer = await this.waitForElement('div[data-testid="post-container"], div.thing');
+
+            if (postContainer) {
+                const contentUrls = this.extractUrlsFromContainer(postContainer);
+                contentUrls.forEach(url => urlsToArchive.add(url));
+            }
+
+            this.log(`Found ${urlsToArchive.size} total URLs to queue.`);
+            for (const url of urlsToArchive) {
+                await this.addToQueue(url);
+            }
+            this.processQueue();
+
+        } catch (err) {
+            console.error('[Wayback-archiver] Error in handlePageChange:', err);
+        }
+    }
+
+    async handleInteraction(event) {
+        if (!this.state.isEnabled) return;
         
-        const iframe = await waitForElement('iframe[src]', postContainer, 3000);
-        if (iframe && iframe.src) {
-            log('Found new iframe, adding to queue:', iframe.src);
-            await addToArchiveQueue(iframe.src);
-            processArchiveQueue();
-        } else {
-            log('Could not find new iframe after click.');
+        const revealButton = event.target.closest('.nsfw-see-more button, div[data-testid="post-content"] button, button[data-testid="nsfw-button-ok"]');
+        if (revealButton) {
+            const postContainer = revealButton.closest('div[data-testid="post-container"], div.thing');
+            if (!postContainer) return;
+
+            this.log('Sensitive content reveal clicked. Waiting for content...');
+            setTimeout(async () => {
+                const newUrls = this.extractUrlsFromContainer(postContainer);
+                if (newUrls.length > 0) {
+                    this.log('Found new content post-click:', newUrls);
+                    for (const url of newUrls) {
+                        await this.addToQueue(url);
+                    }
+                    this.processQueue();
+                }
+            }, 1500);
         }
     }
-  }
 
-  function setupNavHooks() {
-    injectNavigationListener();
-    document.body.addEventListener('click', handleInteraction, true);
-    const debouncedHandlePage = (() => { let t; return () => { clearTimeout(t); t = setTimeout(handlePage, 500); }; })();
-    window.addEventListener('wayback_history_changed', debouncedHandlePage);
-    debouncedHandlePage();
-    setInterval(processArchiveQueue, 60000);
-  }
+    extractUrlsFromContainer(container) {
+        const urls = new Set();
+        const selectors = [
+            'a[data-click-id="body"]', 'a.title',
+            'div[data-test-id="post-content"] a', '.expando .md a',
+            'div[data-media-container] a',
+            'shreddit-player[src]',
+            'iframe[src]'
+        ].join(', ');
 
-  log('Userscript injected.');
-  setupNavHooks();
-})();
+        container.querySelectorAll(selectors).forEach(el => {
+            const url = el.getAttribute('src') || el.href;
+            if (url && url.startsWith('http')) {
+                try {
+                    if (!/reddit\.com|redd\.it/.test(new URL(url).hostname)) {
+                        urls.add(url);
+                    }
+                } catch (e) { /* Ignore invalid URLs */ }
+            }
+        });
+        return Array.from(urls);
+    }
+
+    async addToQueue(url) {
+        const queue = await GM.getValue(this.keys.ARCHIVE_QUEUE, []);
+        if (!queue.some(item => item && item.url === url)) {
+            queue.push({ url, addedAt: Date.now() });
+            await GM.setValue(this.keys.ARCHIVE_QUEUE, queue);
+            this.showToast('Added to archive queue.');
+        }
+    }
+
+    async processQueue() {
+        if (this.state.isQueueProcessing || !this.state.isEnabled) return;
+        
+        const tasks = await GM.getValue(this.keys.ARCHIVE_QUEUE, []);
+        if (tasks.length === 0) return;
+
+        this.state.isQueueProcessing = true;
+        this.log(`Starting batch processing of ${tasks.length} items.`);
+        const succeededUrls = [];
+        const failedUrls = [];
+
+        try {
+            for (const item of tasks) {
+                if (!item || typeof item.url !== 'string') continue;
+                const success = await this.submitToWayback(item.url);
+                if (success) {
+                    await GM.setValue('ts_' + item.url, Date.now());
+                    succeededUrls.push(item.url);
+                } else {
+                    failedUrls.push(item.url);
+                }
+            }
+        } finally {
+            if (succeededUrls.length > 0) {
+                const currentQueue = await GM.getValue(this.keys.ARCHIVE_QUEUE, []);
+                const finalQueue = currentQueue.filter(item => !(item && item.url && succeededUrls.includes(item.url)));
+                await GM.setValue(this.keys.ARCHIVE_QUEUE, finalQueue);
+            }
+            this.state.isQueueProcessing = false;
+            this.log(`Batch complete. ${succeededUrls.length} OK, ${failedUrls.length} failed.`);
+            if (tasks.length > 0) {
+                this.showToast(`Archive complete: ${succeededUrls.length} OK, ${failedUrls.length} failed.`, 5000);
+            }
+        }
+    }
+
+    submitToWayback(url) {
+        const saveUrl = 'https://web.archive.org/save/' + encodeURIComponent(url);
+        return new Promise(resolve => {
+            GM.xmlHttpRequest({
+                method: 'GET',
+                url: saveUrl,
+                timeout: 60000,
+                onload: r => resolve(r.status >= 200 && r.status < 400),
+                onerror: () => resolve(false),
+                ontimeout: () => resolve(false),
+            });
+        });
+    }
+
+    waitForElement(selector, context = document, timeout = 5000) {
+        return new Promise(resolve => {
+            const el = context.querySelector(selector);
+            if (el) return resolve(el);
+            const observer = new MutationObserver(() => {
+                const observedEl = context.querySelector(selector);
+                if (observedEl) {
+                    observer.disconnect();
+                    resolve(observedEl);
+                }
+            });
+            observer.observe(context, { childList: true, subtree: true });
+            setTimeout(() => { observer.disconnect(); resolve(null); }, timeout);
+        });
+    }
+
+    setupEventListeners() {
+        const debouncedHandler = (() => {
+            let timer;
+            return () => { clearTimeout(timer); timer = setTimeout(() => this.handlePageChange(), 500); };
+        })();
+        
+        window.addEventListener('wayback_history_changed', debouncedHandler);
+        document.body.addEventListener('click', (e) => this.handleInteraction(e), true);
+        setInterval(() => this.processQueue(), 60000);
+        
+        GM.registerMenuCommand('Toggle auto-archiving', async () => {
+            this.state.isEnabled = !this.state.isEnabled;
+            await GM.setValue(this.keys.GLOBAL_ENABLED, this.state.isEnabled);
+            const status = this.state.isEnabled ? 'ENABLED' : 'DISABLED';
+            alert(`Reddit → Wayback auto-archiver is now ${status}.`);
+            this.log(`Toggled via menu. Status: ${status}`);
+        });
+
+        debouncedHandler();
+    }
+
+    injectNavigationListener() {
+        const scriptId = 'history-hook-script';
+        const eventName = 'wayback_history_changed';
+        if (document.getElementById(scriptId)) return;
+        const script = document.createElement('script');
+        script.id = scriptId;
+        script.textContent = `(() => {
+            if (window.top !== window.self) return;
+            const dispatch = () => { try { window.dispatchEvent(new CustomEvent('${eventName}')) } catch (e) {} };
+            const hist = history;
+            const push = hist.pushState;
+            const repl = hist.replaceState;
+            hist.pushState = function(...args) { push.apply(this, args); dispatch(); };
+            hist.replaceState = function(...args) { repl.apply(this, args); dispatch(); };
+            window.addEventListener('popstate', dispatch);
+        })();`;
+        (document.head || document.documentElement).appendChild(script);
+    }
+
+    injectStyles() {
+        GM.addStyle(`
+            .wb-toast {
+                position: fixed; bottom: 20px; right: 20px; max-width: 280px;
+                padding: 10px 15px; font: 14px/1.4 system-ui, sans-serif;
+                color: #fff; background: rgba(20, 20, 20, 0.9);
+                border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,.3);
+                opacity: 0; transform: translateY(15px);
+                transition: opacity .3s, transform .3s;
+                z-index: 2147483647; pointer-events: none;
+            }
+            .wb-toast.show { opacity: 1; transform: translateY(0); }
+        `);
+    }
+
+    showToast(message, duration = 3500) {
+        if (!document.body) {
+            window.addEventListener('DOMContentLoaded', () => this.showToast(message, duration));
+            return;
+        }
+        const el = document.createElement('div');
+        el.className = 'wb-toast';
+        el.textContent = message;
+        document.body.appendChild(el);
+        setTimeout(() => el.classList.add('show'), 10);
+        setTimeout(() => {
+            el.classList.remove('show');
+            setTimeout(() => el.remove(), 400);
+        }, duration);
+    }
+}
+
+new RedditArchiver();
