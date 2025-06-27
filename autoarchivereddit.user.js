@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback Auto-Archiver (v4.0 Refactored)
+// @name         Reddit → Wayback Auto-Archiver (v4.2 Final)
 // @namespace    reddit-wayback-autosave
-// @version      4.0.0
-// @description  A clean, stable, and robust script to auto-submit Reddit posts and their content to the Wayback Machine.
+// @version      4.2.0
+// @description  A clean, stable, and robust script to auto-submit Reddit posts and their content. With intelligent URL construction for embeds.
 // @author       Branden Stober (refactored by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -101,7 +101,7 @@ class RedditArchiver {
 
             this.log('New post detected:', canonicalUrl);
             const urlsToArchive = new Set([canonicalUrl]);
-            const postContainer = await this.waitForElement('div[data-testid="post-container"], div.thing');
+            const postContainer = await this.waitForElement('shreddit-post, div.thing');
 
             if (postContainer) {
                 const contentUrls = this.extractUrlsFromContainer(postContainer);
@@ -124,7 +124,7 @@ class RedditArchiver {
         
         const revealButton = event.target.closest('.nsfw-see-more button, div[data-testid="post-content"] button, button[data-testid="nsfw-button-ok"]');
         if (revealButton) {
-            const postContainer = revealButton.closest('div[data-testid="post-container"], div.thing');
+            const postContainer = revealButton.closest('shreddit-post, div.thing');
             if (!postContainer) return;
 
             this.log('Sensitive content reveal clicked. Waiting for content...');
@@ -148,15 +148,30 @@ class RedditArchiver {
             'div[data-test-id="post-content"] a', '.expando .md a',
             'div[data-media-container] a',
             'shreddit-player[src]',
-            'iframe[src]'
+            'iframe[src]',
+            'a.videoLink'
         ].join(', ');
 
         container.querySelectorAll(selectors).forEach(el => {
-            const url = el.getAttribute('src') || el.href;
-            if (url && url.startsWith('http')) {
+            const href = el.getAttribute('href');
+            let potentialUrl = el.src || href;
+
+            if (el.tagName === 'A' && href && href.startsWith('/')) {
+                const innerMedia = el.querySelector('video[poster], img[src]');
+                if (innerMedia) {
+                    try {
+                        const sourceUrl = new URL(innerMedia.poster || innerMedia.src);
+                        const originHost = sourceUrl.hostname.split('.').slice(-2).join('.'); // Handles subdomains like media.redgifs.com
+                        potentialUrl = `https://${originHost}${href}`;
+                        this.log(`Constructed URL: ${potentialUrl}`);
+                    } catch (e) { /* Fallback to href */ }
+                }
+            }
+
+            if (potentialUrl && potentialUrl.startsWith('http')) {
                 try {
-                    if (!/reddit\.com|redd\.it/.test(new URL(url).hostname)) {
-                        urls.add(url);
+                    if (!/reddit\.com|redd\.it/.test(new URL(potentialUrl).hostname)) {
+                        urls.add(potentialUrl);
                     }
                 } catch (e) { /* Ignore invalid URLs */ }
             }
