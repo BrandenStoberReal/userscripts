@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback auto-archiver (Improved v2.1)
+// @name         Reddit → Wayback auto-archiver (Improved v2.2)
 // @namespace    reddit-wayback-autosave
-// @version      2.1.1
-// @description  A robust script to auto-submit Reddit posts and their content to the Wayback Machine. Fixes cross-origin errors.
+// @version      2.2.0
+// @description  A robust script to auto-submit Reddit posts and their content to the Wayback Machine. Features a more reliable content scanner.
 // @author       Branden Stober (fixed by AI, improved by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -120,47 +120,54 @@
     }
   }
 
-  function extractUrlsFromPage() {
+  // IMPROVEMENT 2: More specific and comprehensive selectors.
+  function extractUrlsFromContainer(container) {
       const urls = new Set();
+      // These selectors are now run *inside* the found post container.
       const selectors = [
-          'a[data-click-id="body"]',
-          'img[alt="Post image"]',
-          'div[data-test-id="post-content"] a',
-          'a.title',
-          '.media-preview a',
-          '.expando .md a',
+          'a[data-click-id="body"]', // New Reddit: Main link post URL
+          'a.title',                 // Old Reddit: Main link post URL
+          'div[data-test-id="post-content"] a', // New Reddit: Links in self-text
+          '.expando .md a',          // Old Reddit: Links in self-text
+          'div[data-media-container] a', // New Reddit: Gallery links
+          'img.media-forward-img',   // New Reddit: Image in some media previews
+          'shreddit-player[src]',    // New Reddit: Direct video URL from player
       ].join(', ');
 
-      document.querySelectorAll(selectors).forEach(el => {
-          try {
-            const url = el.tagName === 'IMG' ? el.src : el.href;
-            if (url && url.startsWith('http') && !/reddit\.com|redd\.it/.test(new URL(url).hostname)) {
-                urls.add(url);
-            }
-          } catch (e) { /* Ignore invalid URLs */ }
+      container.querySelectorAll(selectors).forEach(el => {
+          // Use `getAttribute` for custom elements like shreddit-player
+          const url = el.getAttribute('src') || el.href;
+          if (url && url.startsWith('http')) {
+             try {
+                 if (!/reddit\.com|redd\.it/.test(new URL(url).hostname)) {
+                     urls.add(url);
+                 }
+             } catch(e) {/* Ignore invalid URLs */}
+          }
       });
       return Array.from(urls);
   }
 
-  function pollForContentUrls(timeout = 10000, interval = 500) {
-    return new Promise(resolve => {
-        let attempts = 0;
-        const maxAttempts = timeout / interval;
-        const poller = setInterval(() => {
-            const urls = extractUrlsFromPage();
-            if (urls.length > 0) {
-                log(`Found content URLs after ${attempts * interval}ms.`);
-                clearInterval(poller);
-                resolve(urls);
-            } else if (attempts >= maxAttempts) {
-                log('Polling timed out. No unique content URLs found.');
-                clearInterval(poller);
-                resolve([]);
-            }
-            attempts++;
-        }, interval);
-    });
+  // IMPROVEMENT 1: A two-stage wait. First for the container, then for links inside it.
+  function waitForElement(selector, timeout = 10000) {
+      return new Promise((resolve) => {
+          const el = document.querySelector(selector);
+          if (el) return resolve(el);
+          const observer = new MutationObserver(() => {
+              const el = document.querySelector(selector);
+              if (el) {
+                  observer.disconnect();
+                  resolve(el);
+              }
+          });
+          observer.observe(document.body, { childList: true, subtree: true });
+          setTimeout(() => {
+              observer.disconnect();
+              resolve(null); // Resolve with null if timed out
+          }, timeout);
+      });
   }
+
 
   /* ---------- main work ---------- */
   async function handlePage() {
@@ -178,14 +185,33 @@
       }
       await store.set(KEY_LAST_URL, canon);
       log('New post detected:', canon);
-      const allUrlsToArchive = new Set([canon]);
-      const contentUrls = await pollForContentUrls();
-      contentUrls.forEach(url => allUrlsToArchive.add(url));
+
+      // STAGE 1: Wait for the main post container to appear in the DOM.
+      // This covers both new Reddit's data-testid and old Reddit's class-based structure.
+      log('Waiting for post container...');
+      const postContainer = await waitForElement('div[data-testid="post-container"], div.thing');
+      
+      if (!postContainer) {
+          log('Could not find post container, archiving post URL only.');
+          await addToArchiveQueue(canon);
+          processArchiveQueue();
+          return;
+      }
+      log('Post container found. Scanning for content URLs.');
+
+      // STAGE 2: Poll for links *inside* the container.
+      const contentUrls = extractUrlsFromContainer(postContainer);
+
+      const allUrlsToArchive = new Set([canon, ...contentUrls]);
+      
       log(`Total URLs to queue: ${allUrlsToArchive.size}`, Array.from(allUrlsToArchive));
+
       for (const url of allUrlsToArchive) {
           await addToArchiveQueue(url);
       }
+      
       processArchiveQueue();
+
     } catch (err) {
       console.error('[Wayback-archiver] Error in handlePage:', err);
     }
@@ -231,8 +257,6 @@
     const id = 'history-hook-script', ev = 'wayback_history_changed';
     if (document.getElementById(id)) return;
     const s = document.createElement('script'); s.id = id;
-    // **THE FIX IS HERE**: The injected script now checks if it's in the top window.
-    // If not (i.e., it's in an iframe), it does nothing.
     s.textContent = `(()=>{if(window.top!==window.self)return;const d=()=>window.dispatchEvent(new CustomEvent('${ev}')),h=history,p=h.pushState,r=h.replaceState;h.pushState=function(...a){p.apply(this,a);d()};h.replaceState=function(...a){r.apply(this,a);d()};window.addEventListener('popstate',d)})();`;
     (document.head || document.documentElement).appendChild(s);
   }
