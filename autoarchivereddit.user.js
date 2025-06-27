@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Reddit → Wayback auto-archiver (v2.5 Final)
+// @name         Reddit → Wayback auto-archiver (v3.0 Stable)
 // @namespace    reddit-wayback-autosave
-// @version      2.5.0
-// @description  A robust script to auto-submit Reddit posts and their content. Correctly handles SPA navigation, cooldowns, and interactive content.
+// @version      3.0.0
+// @description  A robust script to auto-submit Reddit posts and their content. Reverted to stable, original navigation logic.
 // @author       Branden Stober (fixed by AI, improved by AI)
 // @updateURL    https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
 // @downloadURL  https://raw.githubusercontent.com/BrandenStoberReal/userscripts/main/autoarchivereddit.user.js
@@ -31,7 +31,7 @@
   const HOUR       = 36e5;
   const KEY_GLOBAL = '_enabled';
   const KEY_QUEUE = '_archive_queue';
-  const KEY_LAST_CANONICAL = '_last_canonical_url'; // Restored for SPA navigation
+  const KEY_LAST_URL = '_last_url'; // Using the original key for simplicity
   const store = {
     get: (k, d) => GM.getValue(k, d),
     set: (k, v) => GM.setValue(k, v)
@@ -144,53 +144,45 @@
       });
   }
 
-
   /* ---------- main work ---------- */
-  async function handlePage(isRescan = false) {
+  async function handlePage() {
     if (!isEnabled) return;
     try {
       const canon = getCanonicalPostUrl(location.href);
-
-      // On a rescan, we only care about finding new content, not the page state.
-      if (isRescan) {
-          log('Rescanning page for new content...');
-      } else {
-          const lastCanon = await store.get(KEY_LAST_CANONICAL, null);
-          // **FIX:** If it's the same page as before, do nothing. This is the crucial SPA fix.
-          if (canon === lastCanon) return;
-          
-          await store.set(KEY_LAST_CANONICAL, canon); // Mark this page as "seen"
-
-          if (!canon) return; // Not a post page, nothing more to do.
-
-          const lastTimestamp = await store.get('ts_' + canon, 0);
-          if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
-            log('Cool-down active for:', canon);
-            return;
-          }
-          log('New post detected:', canon);
-      }
-
-      const postContainer = await waitForElement('div[data-testid="post-container"], div.thing');
-      if (!postContainer) {
-          log('Could not find post container.');
+      
+      // If we are not on a post page, reset the last URL. This allows navigating
+      // from a non-post page (like the homepage) to a post to work correctly.
+      if (!canon) {
+          await store.set(KEY_LAST_URL, '');
           return;
       }
       
-      const allUrlsToArchive = new Set();
-      // Only add the main post URL if it's the first scan of a new page.
-      if (!isRescan && canon) {
-          allUrlsToArchive.add(canon);
+      const lastCanonical = await store.get(KEY_LAST_URL, null);
+      // **REVERTED LOGIC:** This is the original, simple check. If we've already handled this page, stop.
+      if (canon === lastCanonical) {
+          return;
+      }
+      
+      const lastTimestamp = await store.get('ts_' + canon, 0);
+      if (Date.now() - lastTimestamp < COOLDOWN_HOURS * HOUR) {
+          log('Cool-down active for:', canon);
+          await store.set(KEY_LAST_URL, canon); // Mark as seen even if on cooldown to prevent re-triggering.
+          return;
+      }
+      
+      log('New post detected:', canon);
+      await store.set(KEY_LAST_URL, canon); // Mark this page as handled.
+
+      const allUrlsToArchive = new Set([canon]);
+      const postContainer = await waitForElement('div[data-testid="post-container"], div.thing');
+      if (postContainer) {
+          const contentUrls = extractUrlsFromContainer(postContainer);
+          contentUrls.forEach(url => allUrlsToArchive.add(url));
       }
 
-      const contentUrls = extractUrlsFromContainer(postContainer);
-      contentUrls.forEach(url => allUrlsToArchive.add(url));
-
-      if (allUrlsToArchive.size > 0) {
-          log(`Found ${allUrlsToArchive.size} total URLs to queue.`);
-          for (const url of allUrlsToArchive) { await addToArchiveQueue(url); }
-          processArchiveQueue();
-      }
+      log(`Found ${allUrlsToArchive.size} total URLs to queue.`);
+      for (const url of allUrlsToArchive) { await addToArchiveQueue(url); }
+      processArchiveQueue();
 
     } catch (err) {
       console.error('[Wayback-archiver] Error in handlePage:', err);
@@ -235,20 +227,29 @@
     (document.head || document.documentElement).appendChild(s);
   }
 
-  function setupInteractionListener() {
-    document.body.addEventListener('click', (event) => {
-        const revealButton = event.target.closest('.nsfw-see-more button, div[data-testid="post-content"] button');
-        if (revealButton) {
-            log('Sensitive content reveal clicked. Triggering a rescan in 2 seconds.');
-            setTimeout(() => handlePage(true), 2000);
+  async function handleInteraction(event) {
+    if (!isEnabled) return;
+    const revealButton = event.target.closest('.nsfw-see-more button, div[data-testid="post-content"] button, button[data-testid="nsfw-button-ok"]');
+    if (revealButton) {
+        log('Sensitive content reveal clicked. Waiting for iframe...');
+        const postContainer = revealButton.closest('div[data-testid="post-container"], div.thing');
+        if (!postContainer) return;
+        
+        const iframe = await waitForElement('iframe[src]', postContainer, 3000);
+        if (iframe && iframe.src) {
+            log('Found new iframe, adding to queue:', iframe.src);
+            await addToArchiveQueue(iframe.src);
+            processArchiveQueue();
+        } else {
+            log('Could not find new iframe after click.');
         }
-    }, true);
+    }
   }
 
   function setupNavHooks() {
     injectNavigationListener();
-    setupInteractionListener();
-    const debouncedHandlePage = (() => { let t; return () => { clearTimeout(t); t = setTimeout(() => handlePage(false), 500); }; })();
+    document.body.addEventListener('click', handleInteraction, true);
+    const debouncedHandlePage = (() => { let t; return () => { clearTimeout(t); t = setTimeout(handlePage, 500); }; })();
     window.addEventListener('wayback_history_changed', debouncedHandlePage);
     debouncedHandlePage();
     setInterval(processArchiveQueue, 60000);
